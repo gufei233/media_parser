@@ -1,0 +1,14 @@
+{
+  "enable_cf_proxy": {
+    "description": "是否启用 Cloudflare 代理",
+    "type": "bool",
+    "hint": "启用后将通过 CF Workers 代理请求抖音 API，可以有效避免 IP 被风控",
+    "default": false
+  },
+  "cf_proxy_url": {
+    "description": "Cloudflare Workers 代理地址",
+    "type": "string",
+    "hint": "填写你部署的 CF Workers 地址，例如: https://your-worker.workers.dev",
+    "default": ""
+  }
+}

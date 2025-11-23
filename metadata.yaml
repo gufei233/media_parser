@@ -1,0 +1,6 @@
+name: media_parser
+display_name: 抖音小红书解析
+author: Author
+description: 自动解析抖音和小红书链接，发送视频、图片等内容
+version: 1.0.0
+repo: ""
