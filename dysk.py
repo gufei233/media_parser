@@ -330,7 +330,9 @@ class Extractor:
                 result["downloads"] = [self.safe_extract(i, "url_list[0]") for i in images]
         else:
             result["type"] = "视频"
-            result["duration"] = self.time_conversion(self.safe_extract(data_dict, "video.duration", 0))
+            duration_ms = self.safe_extract(data_dict, "video.duration", 0)
+            result["duration"] = self.time_conversion(duration_ms)
+            result["duration_seconds"] = duration_ms // 1000  # 添加秒数用于限制检查
             video_url = self._get_best_video_url(data_dict)
             cover_url = self.safe_extract(data_dict, "video.cover.url_list[0]")
             result["downloads"] = [{

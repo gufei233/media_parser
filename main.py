@@ -1,45 +1,82 @@
+"""
+媒体解析插件主文件 - 完全异步版本
+支持解析抖音和小红书链接
+"""
 import re
+import os
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import tempfile
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+from astrbot.api import logger, AstrBotConfig
 import astrbot.api.message_components as Comp
 
 try:
-    from .dysk import DouyinDownloader
-    from .xhs import XiaohongshuParser
+    from .config import MediaParserConfig
+    from .debounce import Debouncer
+    from .async_dysk import AsyncDouyinDownloader
+    from .async_xhs import AsyncXiaohongshuParser
 except ImportError:
-    from dysk import DouyinDownloader
-    from xhs import XiaohongshuParser
+    from config import MediaParserConfig
+    from debounce import Debouncer
+    from async_dysk import AsyncDouyinDownloader
+    from async_xhs import AsyncXiaohongshuParser
 
-@register("media_parser", "Author", "抖音小红书链接解析插件", "1.0.0")
+
+@register("media_parser", "Author", "抖音小红书链接解析插件（异步优化版）", "2.1.2")
 class MediaParserPlugin(Star):
-    def __init__(self, context: Context, config=None):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
-        self.config = config or {}
-        self.xhs_parser = XiaohongshuParser()
-        self.executor = ThreadPoolExecutor(max_workers=10)
-        self.dy_downloader = None
-        self.dy_downloader_time = 0
 
+        # 配置管理
+        self.cfg = MediaParserConfig(config)
+
+        # 防抖器（使用 lambda 实现动态配置）
+        self.debouncer = Debouncer(lambda: self.cfg.debounce_interval)
+
+        # ========== 异步解析器 ==========
+        # 小红书解析器
+        self.xhs_parser = AsyncXiaohongshuParser()
+
+        # 抖音下载器（每次请求时创建新实例，避免 session 复用问题）
+
+        # 链接匹配正则
         self.dy_patterns = [
-            r'https?://v\.douyin\.com/[a-zA-Z0-9_-]+/?',
-            r'https?://(?:www\.)?douyin\.com/[^\s]+',
-            r'https?://(?:www\.)?iesdouyin\.com/[^\s]+'
+            r"https?://v\.douyin\.com/[a-zA-Z0-9_-]+/?",
+            r"https?://(?:www\.)?douyin\.com/[^\s]+",
+            r"https?://(?:www\.)?iesdouyin\.com/[^\s]+",
         ]
         self.xhs_patterns = [
-            r'https?://(?:www\.)?xiaohongshu\.com/[^\s]+',
-            r'https?://xhslink\.com/[^\s]+'
+            r"https?://(?:www\.)?xiaohongshu\.com/[^\s]+",
+            r"https?://xhslink\.com/[^\s]+",
         ]
+
+        logger.info("媒体解析插件初始化完成（异步版）")
+        logger.info(f"白名单会话数: {len(self.cfg.enabled_sessions)}")
+        logger.info(f"防抖时间: {self.cfg.debounce_interval}秒")
+        logger.info(f"最大文件大小: {self.cfg.source_max_size}MB")
+        logger.info(f"最大视频时长: {self.cfg.source_max_minute}分钟")
+
+    async def terminate(self):
+        """插件卸载时清理资源"""
+        logger.info("正在清理资源...")
+        if self.xhs_parser:
+            await self.xhs_parser.close()
+        logger.info("资源清理完成")
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def parse_media_link(self, event: AstrMessageEvent):
-        if not event.is_private_chat() and not event.is_at_or_wake_command:
+        """媒体链接解析入口"""
+        # ========== 白名单过滤 ==========
+        umo = event.unified_msg_origin
+        if not self.cfg.is_session_enabled(
+            umo, event.is_admin(), event.is_at_or_wake_command
+        ):
             return
 
         text = event.message_str
 
+        # ========== 匹配链接 ==========
         dy_url = None
         for pattern in self.dy_patterns:
             match = re.search(pattern, text)
@@ -54,6 +91,17 @@ class MediaParserPlugin(Star):
                 xhs_url = match.group(0)
                 break
 
+        # 没有匹配到链接
+        if not dy_url and not xhs_url:
+            return
+
+        # ========== 防抖检查 ==========
+        check_url = dy_url or xhs_url
+        if self.debouncer.hit_link(umo, check_url):
+            logger.warning(f"[链接防抖] 链接 {check_url} 在防抖时间内，跳过解析")
+            return
+
+        # ========== 解析处理 ==========
         if dy_url:
             async for result in self.parse_douyin(event, dy_url):
                 yield result
@@ -63,272 +111,304 @@ class MediaParserPlugin(Star):
                 yield result
             event.stop_event()
 
-    def _parse_douyin_sync(self, url):
-        import sys
-        from io import StringIO
-        import time
-
-        max_retries = 5
-        retry_delay = 5
-
-        for attempt in range(max_retries):
-            old_stdout = sys.stdout
-            sys.stdout = captured_output = StringIO()
-
-            try:
-                current_time = time.time()
-
-                # 首次尝试或重试时，检查是否需要重新创建实例
-                enable_cf = self.config.get("enable_cf_proxy", False)
-                cf_url = self.config.get("cf_proxy_url", "")
-
-                if attempt == 0:
-                    # 首次尝试：复用 downloader 实例，但每 5 分钟重新创建一次
-                    if self.dy_downloader is None or (current_time - self.dy_downloader_time) > 300:
-                        logger.info("创建新的 DouyinDownloader 实例")
-                        self.dy_downloader = DouyinDownloader(enable_cf_proxy=enable_cf, cf_proxy_url=cf_url)
-                        self.dy_downloader_time = current_time
-                    else:
-                        logger.info("复用现有的 DouyinDownloader 实例")
-                else:
-                    # 重试时：强制重新创建实例
-                    logger.info(f"第 {attempt + 1} 次重试，重新创建 DouyinDownloader 实例")
-                    self.dy_downloader = DouyinDownloader(enable_cf_proxy=enable_cf, cf_proxy_url=cf_url)
-                    self.dy_downloader_time = current_time
-
-                result = self.dy_downloader.get_detail(url)
-
-                output = captured_output.getvalue()
-                sys.stdout = old_stdout
-
-                logger.info(f"dysk.py 输出长度: {len(output)}")
-                if output:
-                    logger.info(f"dysk.py 输出:\n{output}")
-                else:
-                    logger.warning("dysk.py 没有任何输出")
-
-                logger.info(f"解析结果: {result is not None}")
-
-                # 如果解析成功，返回结果
-                if result is not None:
-                    return (result, self.dy_downloader)
-
-                # 如果解析失败且还有重试次数
-                if attempt < max_retries - 1:
-                    logger.warning(f"解析返回 None，{retry_delay} 秒后进行第 {attempt + 2} 次尝试")
-                    time.sleep(retry_delay)
-                else:
-                    logger.error(f"已重试 {max_retries} 次，仍然解析失败")
-                    return (None, self.dy_downloader)
-
-            except Exception as e:
-                sys.stdout = old_stdout
-                import traceback
-                logger.error(f"第 {attempt + 1} 次尝试同步解析失败: {e}\n{traceback.format_exc()}")
-
-                if attempt < max_retries - 1:
-                    logger.info(f"{retry_delay} 秒后进行第 {attempt + 2} 次尝试")
-                    time.sleep(retry_delay)
-                else:
-                    raise
-            finally:
-                sys.stdout = old_stdout
-
-        return (None, self.dy_downloader)
-
-    async def _send_media_async(self, event, dy_downloader, images, video_links):
-        """异步后台任务：下载并发送媒体文件"""
-        import tempfile
-        import os
-
-        logger.info(f"开始下载媒体文件: {len(images)}张图片, {len(video_links)}个视频")
-        loop = asyncio.get_event_loop()
-
-        # 立即下载所有文件（避免链接过期）
-        downloaded_images = []
-        for i, img_url in enumerate(images):
-            try:
-                logger.info(f"下载图片 {i+1}/{len(images)}")
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-                temp_path = temp_file.name
-                temp_file.close()
-
-                success = await loop.run_in_executor(
-                    self.executor,
-                    dy_downloader.download_video,
-                    img_url,
-                    temp_path,
-                    logger.info
-                )
-                logger.info(f"图片 {i+1} 下载{'成功' if success else '失败'}")
-                downloaded_images.append((success, temp_path, img_url))
-            except Exception as e:
-                logger.error(f"图片下载异常: {e}")
-                downloaded_images.append((False, None, img_url))
-
-        downloaded_videos = []
-        for i, video_url in enumerate(video_links):
-            try:
-                logger.info(f"下载视频 {i+1}/{len(video_links)}")
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-                temp_path = temp_file.name
-                temp_file.close()
-
-                success = await loop.run_in_executor(
-                    self.executor,
-                    dy_downloader.download_video,
-                    video_url,
-                    temp_path,
-                    logger.info
-                )
-                logger.info(f"视频 {i+1} 下载{'成功' if success else '失败'}")
-                downloaded_videos.append((success, temp_path, video_url))
-            except Exception as e:
-                logger.error(f"视频下载异常: {e}")
-                downloaded_videos.append((False, None, video_url))
-
-        # 延迟发送
-        for success, temp_path, img_url in downloaded_images:
-            try:
-                await asyncio.sleep(2)
-                if success and temp_path and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-                    result = event.make_result()
-                    result.chain = [Comp.Image.fromFileSystem(temp_path)]
-                    await event.send(result)
-                    try:
-                        os.unlink(temp_path)
-                    except:
-                        pass
-                else:
-                    await event.send(event.image_result(img_url))
-                    if temp_path and os.path.exists(temp_path):
-                        try:
-                            os.unlink(temp_path)
-                        except:
-                            pass
-            except Exception as e:
-                logger.error(f"图片发送失败: {e}")
-
-        for success, temp_path, video_url in downloaded_videos:
-            try:
-                await asyncio.sleep(3)
-                if success and temp_path and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-                    result = event.make_result()
-                    result.chain = [Comp.Video.fromFileSystem(temp_path)]
-                    await event.send(result)
-                    try:
-                        os.unlink(temp_path)
-                    except:
-                        pass
-                else:
-                    await event.send(event.plain_result(f"视频链接: {video_url}"))
-                    if temp_path and os.path.exists(temp_path):
-                        try:
-                            os.unlink(temp_path)
-                        except:
-                            pass
-            except Exception as e:
-                logger.error(f"视频发送失败: {e}")
+    # ==================== 抖音解析（完全异步）====================
 
     async def parse_douyin(self, event: AstrMessageEvent, url: str):
+        """解析抖音链接（异步版本）"""
         try:
             logger.info(f"开始解析抖音链接: {url}")
-            loop = asyncio.get_event_loop()
-            result, dy_downloader = await loop.run_in_executor(self.executor, self._parse_douyin_sync, url)
 
-            if not result:
-                logger.error("dysk.py 返回 None，可能被风控")
-                yield event.plain_result(f"解析失败，请直接打开链接查看:\n{url}")
-                return
+            # 每次创建新的下载器实例，避免 session 复用问题
+            dy_downloader = AsyncDouyinDownloader(
+                enable_cf_proxy=self.cfg.enable_cf_proxy,
+                cf_proxy_url=self.cfg.cf_proxy_url,
+                download_retry_times=self.cfg.download_retry_times,
+                download_timeout=self.cfg.download_timeout,
+                common_timeout=self.cfg.common_timeout,
+                max_size=self.cfg.max_size,
+                max_duration=self.cfg.max_duration,
+            )
 
-            uin = event.get_sender_id()
-            name = event.get_sender_name()
+            try:
+                # 异步解析
+                result = await dy_downloader.get_detail(url)
 
-            nodes = []
+                if not result:
+                    logger.error("解析返回 None，可能被风控")
+                    yield event.plain_result(f"解析失败，请直接打开链接查看:\n{url}")
+                    return
 
-            author = result.get('author') or {}
-            info_text = f"id: {result.get('id', '')}\ndesc: {result.get('desc', '')}\ncreate_time: {result.get('create_time', '')}\nnickname: {author.get('nickname', '')}"
-            nodes.append(Comp.Node(uin=uin, name=name, content=[Comp.Plain(info_text)]))
+                uin = event.get_sender_id()
+                name = event.get_sender_name()
 
-            music = result.get('music') or {}
-            music_text = f"uid: {author.get('uid', '')}\nauthor: {music.get('author', '')}\ntitle: {music.get('title', '')}\nurl: {music.get('url', '')}"
-            nodes.append(Comp.Node(uin=uin, name=name, content=[Comp.Plain(music_text)]))
+                # ========== 构造合并转发消息 ==========
+                nodes = []
 
-            stats = result.get('statistics') or {}
-            stats_text = f"digg_count: {stats.get('digg_count', 0)}\ncomment_count: {stats.get('comment_count', 0)}\ncollect_count: {stats.get('collect_count', 0)}\nshare_count: {stats.get('share_count', 0)}"
-            nodes.append(Comp.Node(uin=uin, name=name, content=[Comp.Plain(stats_text)]))
+                author = result.get("author") or {}
+                info_text = f"id: {result.get('id', '')}\ndesc: {result.get('desc', '')}\ncreate_time: {result.get('create_time', '')}\nnickname: {author.get('nickname', '')}"
+                nodes.append(
+                    Comp.Node(uin=uin, name=name, content=[Comp.Plain(info_text)])
+                )
 
-            type_text = f"type: {result.get('type', '')}"
-            duration_str = result.get('duration', '')
+                music = result.get("music") or {}
+                music_text = f"uid: {author.get('uid', '')}\nauthor: {music.get('author', '')}\ntitle: {music.get('title', '')}\nurl: {music.get('url', '')}"
+                nodes.append(
+                    Comp.Node(uin=uin, name=name, content=[Comp.Plain(music_text)])
+                )
 
-            if result.get('type') == '视频' and duration_str:
-                type_text += f"\nduration: {duration_str}"
+                stats = result.get("statistics") or {}
+                stats_text = f"digg_count: {stats.get('digg_count', 0)}\ncomment_count: {stats.get('comment_count', 0)}\ncollect_count: {stats.get('collect_count', 0)}\nshare_count: {stats.get('share_count', 0)}"
+                nodes.append(
+                    Comp.Node(uin=uin, name=name, content=[Comp.Plain(stats_text)])
+                )
 
-            nodes.append(Comp.Node(uin=uin, name=name, content=[Comp.Plain(type_text)]))
+                type_text = f"type: {result.get('type', '')}"
+                duration_str = result.get("duration", "")
 
-            yield event.chain_result([Comp.Nodes(nodes=nodes)])
+                if result.get("type") == "视频" and duration_str:
+                    type_text += f"\nduration: {duration_str}"
 
-            downloads = result.get('downloads', [])
-            images = []
-            video_links = []
+                nodes.append(
+                    Comp.Node(uin=uin, name=name, content=[Comp.Plain(type_text)])
+                )
 
-            for item in downloads:
-                if isinstance(item, str):
-                    images.append(item)
-                elif isinstance(item, dict):
-                    if item.get('type') == 'video':
-                        if item.get('cover'):
-                            images.append(item['cover'])
-                        video_links.append(item['url'])
-                    elif item.get('type') == 'live_photo':
-                        if item.get('image'):
-                            images.append(item['image'])
-                        if item.get('video'):
-                            video_links.append(item['video'])
+                yield event.chain_result([Comp.Nodes(nodes=nodes)])
 
-            logger.info(f"准备发送媒体: {len(images)}张图片, {len(video_links)}个视频")
-            if images or video_links:
-                task = asyncio.create_task(self._send_media_async(event, dy_downloader, images, video_links))
-                # 确保任务不会被取消
-                task.add_done_callback(lambda t: logger.info("媒体发送任务完成") if not t.exception() else logger.error(f"媒体发送任务异常: {t.exception()}"))
-            else:
-                logger.warning("没有媒体文件需要发送")
+                # ========== 检查视频时长限制 ==========
+                duration_seconds = result.get("duration_seconds", 0)
+                if result.get("type") == "视频" and duration_seconds > 0:
+                    if self.cfg.max_duration and duration_seconds > self.cfg.max_duration:
+                        max_minutes = self.cfg.max_duration / 60
+                        actual_minutes = duration_seconds / 60
+                        warning_msg = f"⚠️ 视频时长 {actual_minutes:.1f} 分钟超过限制 {max_minutes:.1f} 分钟，不下载视频"
+                        logger.warning(warning_msg)
+                        if self.cfg.show_download_fail_tip:
+                            yield event.plain_result(warning_msg)
+                        return
+
+                # ========== 提取媒体链接 ==========
+                downloads = result.get("downloads", [])
+                images = []
+                video_links = []
+
+                for item in downloads:
+                    if isinstance(item, str):
+                        images.append(item)
+                    elif isinstance(item, dict):
+                        if item.get("type") == "video":
+                            if item.get("cover"):
+                                images.append(item["cover"])
+                            video_links.append(item["url"])
+                        elif item.get("type") == "live_photo":
+                            if item.get("image"):
+                                images.append(item["image"])
+                            if item.get("video"):
+                                video_links.append(item["video"])
+
+                logger.info(f"准备发送媒体: {len(images)}张图片, {len(video_links)}个视频")
+
+                # ========== 异步下载并发送 ==========
+                if images or video_links:
+                    await self._send_media_async(
+                        event, dy_downloader, images, video_links
+                    )
+                else:
+                    logger.warning("没有媒体文件需要发送")
+
+            finally:
+                # 关闭下载器
+                await dy_downloader.close()
 
         except Exception as e:
             import traceback
+
             error_msg = f"抖音解析失败: {e}\n{traceback.format_exc()}"
             logger.error(error_msg)
-            yield event.plain_result(f"解析失败: {str(e)}")
+            if self.cfg.show_download_fail_tip:
+                yield event.plain_result(f"解析失败: {str(e)}")
+
+    async def _send_media_async(self, event, dy_downloader, images, video_links):
+        """异步下载并发送媒体文件"""
+        logger.info(f"开始下载媒体文件: {len(images)}张图片, {len(video_links)}个视频")
+
+        # 下载所有图片
+        for i, img_url in enumerate(images):
+            try:
+                logger.info(f"下载图片 {i+1}/{len(images)}")
+
+                # 创建临时文件
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                temp_path = temp_file.name
+                temp_file.close()
+
+                # 异步下载
+                success = await dy_downloader.download_video(img_url, temp_path)
+
+                # 延迟发送
+                await asyncio.sleep(2)
+
+                if success and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                    result = event.make_result()
+                    result.chain = [Comp.Image.fromFileSystem(temp_path)]
+                    await event.send(result)
+                    logger.info(f"图片 {i+1} 发送成功")
+                else:
+                    if self.cfg.show_download_fail_tip:
+                        await event.send(event.plain_result(f"图片下载失败: {img_url}"))
+                    logger.warning(f"图片 {i+1} 下载失败")
+
+                # 清理临时文件
+                if os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except Exception as e:
+                        logger.warning(f"清理临时文件失败: {temp_path}, {e}")
+
+            except Exception as e:
+                logger.error(f"图片 {i+1} 处理异常: {e}")
+
+        # 下载所有视频
+        for i, video_url in enumerate(video_links):
+            try:
+                logger.info(f"下载视频 {i+1}/{len(video_links)}")
+
+                # 创建临时文件
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                temp_path = temp_file.name
+                temp_file.close()
+
+                # 异步下载
+                success = await dy_downloader.download_video(video_url, temp_path)
+
+                # 延迟发送
+                await asyncio.sleep(3)
+
+                if success and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                    result = event.make_result()
+                    result.chain = [Comp.Video.fromFileSystem(temp_path)]
+                    await event.send(result)
+                    logger.info(f"视频 {i+1} 发送成功")
+                else:
+                    if self.cfg.show_download_fail_tip:
+                        await event.send(event.plain_result(f"视频链接: {video_url}"))
+                    logger.warning(f"视频 {i+1} 下载失败")
+
+                # 清理临时文件
+                if os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except Exception as e:
+                        logger.warning(f"清理临时文件失败: {temp_path}, {e}")
+
+            except Exception as e:
+                logger.error(f"视频 {i+1} 处理异常: {e}")
+
+    # ==================== 小红书解析（完全异步）====================
 
     async def parse_xiaohongshu(self, event: AstrMessageEvent, url: str):
+        """解析小红书链接（异步版本）"""
         try:
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(self.executor, self.xhs_parser.parse, url)
+            logger.info(f"开始解析小红书链接: {url}")
 
-            if result.get('error'):
-                yield event.plain_result(f"解析失败: {result.get('message', '未知错误')}")
+            # 异步解析
+            result = await self.xhs_parser.parse(url)
+
+            if result.get("error"):
+                error_msg = result.get("message", "未知错误")
+                logger.error(f"小红书解析失败: {error_msg}")
+                if self.cfg.show_download_fail_tip:
+                    yield event.plain_result(f"解析失败: {error_msg}")
                 return
 
             uin = event.get_sender_id()
             name = event.get_sender_name()
 
+            # ========== 构造合并转发消息 ==========
             nodes = []
-            nodes.append(Comp.Node(uin=uin, name=name, content=[Comp.Plain(f"title: {result.get('title', '小红书内容')}")]))
-            nodes.append(Comp.Node(uin=uin, name=name, content=[Comp.Plain(f"content: {result.get('content', '')}")]))
+            nodes.append(
+                Comp.Node(
+                    uin=uin,
+                    name=name,
+                    content=[
+                        Comp.Plain(f"title: {result.get('title', '小红书内容')}")
+                    ],
+                )
+            )
+            nodes.append(
+                Comp.Node(
+                    uin=uin,
+                    name=name,
+                    content=[Comp.Plain(f"content: {result.get('content', '')}")],
+                )
+            )
 
             yield event.chain_result([Comp.Nodes(nodes=nodes)])
 
-            if result.get('cover'):
-                yield event.chain_result([Comp.Image.fromURL(result['cover'])])
+            # ========== 发送封面 ==========
+            if result.get("cover"):
+                yield event.chain_result([Comp.Image.fromURL(result["cover"])])
 
-            if result.get('images'):
-                for img_url in result['images']:
+            # ========== 发送图片 ==========
+            if result.get("images"):
+                for img_url in result["images"]:
                     yield event.chain_result([Comp.Image.fromURL(img_url)])
 
-            if result.get('videos'):
-                for video_url in result['videos']:
+            # ========== 发送视频 ==========
+            if result.get("videos"):
+                for video_url in result["videos"]:
                     yield event.chain_result([Comp.Video.fromURL(video_url)])
 
         except Exception as e:
-            logger.error(f"小红书解析失败: {e}")
-            yield event.plain_result(f"解析失败: {str(e)}")
+            import traceback
+
+            error_msg = f"小红书解析失败: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            if self.cfg.show_download_fail_tip:
+                yield event.plain_result(f"解析失败: {str(e)}")
+
+    # ==================== 管理员命令 ====================
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("开启解析")
+    async def enable_parser(self, event: AstrMessageEvent):
+        """开启当前会话的解析"""
+        umo = event.unified_msg_origin
+        if umo not in self.cfg.enabled_sessions:
+            self.cfg.add_enabled_session(umo)
+            yield event.plain_result("✅ 解析已开启")
+        else:
+            yield event.plain_result("✅ 解析已开启，无需重复开启")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("关闭解析")
+    async def disable_parser(self, event: AstrMessageEvent):
+        """关闭当前会话的解析"""
+        umo = event.unified_msg_origin
+        if umo in self.cfg.enabled_sessions:
+            self.cfg.remove_enabled_session(umo)
+            yield event.plain_result("❌ 解析已关闭")
+        elif len(self.cfg.enabled_sessions) == 0:
+            yield event.plain_result("ℹ️ 解析白名单为空时，全局开启解析")
+        else:
+            yield event.plain_result("❌ 解析已关闭，无需重复关闭")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("解析状态")
+    async def parser_status(self, event: AstrMessageEvent):
+        """查看当前插件状态"""
+        umo = event.unified_msg_origin
+        is_enabled = self.cfg.is_session_enabled(
+            umo, event.is_admin(), event.is_at_or_wake_command
+        )
+
+        status_text = f"""📊 媒体解析插件状态（异步版）
+
+🎯 当前会话: {'✅ 已开启' if is_enabled else '❌ 已关闭'}
+📋 白名单数量: {len(self.cfg.enabled_sessions)} 个会话
+⏱️ 防抖时间: {self.cfg.debounce_interval} 秒
+📦 最大文件大小: {self.cfg.source_max_size} MB
+⏰ 最大视频时长: {self.cfg.source_max_minute} 分钟
+🔄 下载重试次数: {self.cfg.download_retry_times} 次
+☁️ CF 代理: {'✅ 已启用' if self.cfg.enable_cf_proxy else '❌ 未启用'}
+"""
+        yield event.plain_result(status_text)

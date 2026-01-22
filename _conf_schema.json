@@ -1,4 +1,93 @@
 {
+  "enabled_sessions": {
+    "description": "解析白名单",
+    "hint": "仅解析名单中的群聊发的链接，但bot管理员不受限制，艾特唤醒bot时不受限制。在会话中使用命令【开启解析】和【关闭解析】来设置某会话的解析状态。留空表示所有会话都启用解析功能",
+    "type": "list",
+    "default": []
+  },
+  "debounce_interval": {
+    "description": "防抖秒数",
+    "hint": "防抖机制：同一个会话下，防抖时间内不解析那些已经解析过的链接。设为 0 表示不启用防抖机制",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 600,
+      "step": 10
+    },
+    "default": 300
+  },
+  "source_max_size": {
+    "description": "资源最大大小（MB）",
+    "hint": "允许下载的音视频最大体积，单位 MB",
+    "type": "int",
+    "slider": {
+      "min": 10,
+      "max": 500,
+      "step": 10
+    },
+    "default": 90
+  },
+  "source_max_minute": {
+    "description": "资源最大时长（分钟）",
+    "hint": "允许下载的音视频最大时长，超过则不解析",
+    "type": "int",
+    "slider": {
+      "min": 1,
+      "max": 60,
+      "step": 1
+    },
+    "default": 15
+  },
+  "download_timeout": {
+    "description": "下载请求超时秒数",
+    "hint": "下载视频、音频等较大文件时的请求超时时间，单位秒。建议设置大一点，视频、音频较大时下载耗时较长",
+    "type": "int",
+    "slider": {
+      "min": 10,
+      "max": 600,
+      "step": 10
+    },
+    "default": 280
+  },
+  "download_retry_times": {
+    "description": "下载失败重试次数",
+    "hint": "下载失败时，最多重试的次数",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 5,
+      "step": 1
+    },
+    "default": 3
+  },
+  "common_timeout": {
+    "description": "普通请求超时时间",
+    "hint": "普通请求超时时间，单位秒。用于一些普通的请求",
+    "type": "int",
+    "slider": {
+      "min": 5,
+      "max": 60,
+      "step": 1
+    },
+    "default": 15
+  },
+  "show_download_fail_tip": {
+    "description": "提示下载失败项",
+    "hint": "关闭后将不再发送与下载失败相关的提示（如【下载失败】、【超过文件大小限制】等）",
+    "type": "bool",
+    "default": true
+  },
+  "forward_threshold": {
+    "description": "转发阈值",
+    "hint": "硬性要求：解析生成的消息条数达到此阈值时，将消息合并转发",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 10,
+      "step": 1
+    },
+    "default": 3
+  },
   "enable_cf_proxy": {
     "description": "是否启用 Cloudflare 代理",
     "type": "bool",
