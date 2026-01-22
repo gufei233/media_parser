@@ -2,6 +2,7 @@
 
 
 抖音和小红书链接解析插件（异步优化版），使用 aiohttp 实现完全异步请求，提升性能和稳定性。
+由于抖音的风控，请参考`cloudflare_worker_v2.js`自行部署Cloudflare 代理。
 
 ---
 
