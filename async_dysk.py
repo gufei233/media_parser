@@ -339,23 +339,33 @@ class AsyncDouyinDownloader:
         """
         session = await self._get_session()
 
+        # 下载请求头（参考 TikTokDownloader）
+        # - 始终带 Range: bytes=0- 告知CDN客户端支持续传
+        # - 使用极简Cookie，避免被CDN识别为异常请求
+        # - Accept 使用 */* 而非复杂的 MIME 列表
         headers = {
             "User-Agent": USERAGENT,
-            "Accept": "image/webp,image/apng,image/*,video/mp4,*/*;q=0.8",
-            "Referer": "https://www.douyin.com/",
+            "Accept": "*/*",
+            "Range": "bytes=0-",
+            "Referer": "https://www.douyin.com/?recommend=1",
+            "Cookie": "dy_swidth=1536; dy_sheight=864",
         }
 
         # ========== 第一步：尝试直连下载（支持断点续传）==========
         total_size = 0  # 已下载的总字节数
         expected_size = None  # 文件总大小（从首次请求获取）
-        max_retries = self.download_retry_times * 3  # 续传允许更多次重试
+        max_stall = self.download_retry_times  # 连续无进展最大次数
+        stall_count = 0  # 连续无进展计数
+        attempt = 0
 
         logger.info(f"[下载] 开始: {save_path}")
 
-        for attempt in range(max_retries):
+        while stall_count < max_stall:
+            attempt += 1
+            prev_size = total_size
             try:
-                if attempt > 0:
-                    await asyncio.sleep(min(2 * attempt, 10))
+                if attempt > 1:
+                    await asyncio.sleep(min(2 * stall_count + 1, 10))
 
                 req_headers = dict(headers)
                 file_mode = 'wb'
@@ -364,9 +374,9 @@ class AsyncDouyinDownloader:
                 if total_size > 0 and os.path.exists(save_path):
                     req_headers["Range"] = f"bytes={total_size}-"
                     file_mode = 'ab'  # 追加模式
-                    logger.info(f"[下载] 续传从 {total_size} bytes 开始 (尝试 {attempt+1}/{max_retries})")
-                elif attempt > 0:
-                    logger.info(f"[下载] 重试 {attempt}/{max_retries}")
+                    logger.info(f"[下载] 续传从 {total_size} bytes 开始 (第{attempt}次请求, 停滞{stall_count}/{max_stall})")
+                elif attempt > 1:
+                    logger.info(f"[下载] 重试 (第{attempt}次请求)")
 
                 timeout = aiohttp.ClientTimeout(total=self.download_timeout)
 
@@ -384,29 +394,31 @@ class AsyncDouyinDownloader:
                     if status not in (200, 206):
                         logger.error(f"[下载] 失败: HTTP {status}")
                         if status == 403:
-                            # 403 不续传，重置
                             total_size = 0
+                        # 不算有进展
+                        stall_count += 1
                         continue
 
-                    # 首次请求（200）时获取文件总大小
+                    # 获取文件总大小
                     if status == 200:
-                        total_size = 0  # 200 表示服务器不支持续传或从头开始
+                        total_size = 0
                         file_mode = 'wb'
                         expected_size = resp.content_length
-                        if expected_size and self.max_size and expected_size > self.max_size:
-                            size_mb = expected_size / 1024 / 1024
-                            limit_mb = self.max_size / 1024 / 1024
-                            logger.warning(f"[下载] 文件大小 {size_mb:.2f}MB 超过限制 {limit_mb:.2f}MB")
-                            return False
                     elif status == 206:
-                        # 206 Partial Content - 续传成功
-                        # 尝试从 Content-Range 获取总大小
                         content_range = resp.headers.get("Content-Range", "")
                         if "/" in content_range:
                             try:
                                 expected_size = int(content_range.split("/")[-1])
                             except (ValueError, IndexError):
                                 pass
+                        if total_size == 0:
+                            file_mode = 'wb'
+
+                    if expected_size and self.max_size and expected_size > self.max_size:
+                        size_mb = expected_size / 1024 / 1024
+                        limit_mb = self.max_size / 1024 / 1024
+                        logger.warning(f"[下载] 文件大小 {size_mb:.2f}MB 超过限制 {limit_mb:.2f}MB")
+                        return False
 
                     try:
                         with open(save_path, file_mode) as f:
@@ -434,36 +446,36 @@ class AsyncDouyinDownloader:
                                 return True
                             else:
                                 logger.warning(f"[下载] 连接断开，已下载 {ratio:.1%} ({total_size}/{expected_size} bytes)，将续传...")
-                                continue  # 继续循环，下次用 Range 续传
                         else:
-                            # 没有 expected_size，且流正常结束，视为成功
                             logger.info(f"[下载] 完成: {save_path}, 大小: {total_size} bytes")
                             return True
 
                     except aiohttp.ClientPayloadError:
-                        # 连接中断，检查是否需要续传
                         if expected_size and total_size > 0:
                             ratio = total_size / expected_size
                             if ratio >= 0.95:
                                 logger.warning(f"[下载] 近似完成（{ratio:.1%}）: {save_path}, {total_size}/{expected_size} bytes")
                                 return True
                             logger.warning(f"[下载] 连接中断（{ratio:.1%}），已下载 {total_size}/{expected_size} bytes，将续传...")
-                            continue
                         elif total_size > 0:
                             logger.warning(f"[下载] 连接中断（无总大小），已下载 {total_size} bytes，将续传...")
-                            continue
                         else:
                             logger.error(f"[下载] Payload 错误，无数据")
 
             except asyncio.TimeoutError:
                 if total_size > 0 and expected_size:
                     logger.warning(f"[下载] 超时，已下载 {total_size}/{expected_size} bytes，将续传...")
-                    continue
-                logger.error(f"[下载] 超时 (尝试 {attempt+1}/{max_retries})")
+                else:
+                    logger.error(f"[下载] 超时 (第{attempt}次请求)")
             except Exception as e:
-                logger.error(f"[下载] 异常 (尝试 {attempt+1}/{max_retries}): {e}")
-                # 异常后重置，从头开始
+                logger.error(f"[下载] 异常 (第{attempt}次请求): {e}")
                 total_size = 0
+
+            # 更新停滞计数：有进展则重置，否则+1
+            if total_size > prev_size:
+                stall_count = 0
+            else:
+                stall_count += 1
 
         # 直连全部失败，检查是否有部分下载的数据可用
         if total_size > 0 and expected_size:

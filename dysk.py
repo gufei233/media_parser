@@ -346,7 +346,9 @@ class Extractor:
     def _get_best_video_url(self, data):
         bit_rate = self.safe_extract(data, "video.bit_rate", [])
         if not bit_rate:
-            return self.safe_extract(data, "video.play_addr.url_list[0]")
+            # 回退：取 url_list 最后一个（最稳定的CDN节点）
+            url_list = self.safe_extract(data, "video.play_addr.url_list", [])
+            return url_list[-1] if url_list else ""
         try:
             candidates = []
             for i in bit_rate:
@@ -360,9 +362,12 @@ class Extractor:
                     play_addr.get("url_list", [])
                 ))
             candidates.sort(key=lambda x: (max(x[3], x[4]), x[0], x[1], x[2]))
-            return candidates[-1][-1][0] if candidates and candidates[-1][-1] else ""
+            # 使用 url_list[-1]（最后一个CDN节点，最稳定）
+            url_list = candidates[-1][-1] if candidates else []
+            return url_list[-1] if url_list else ""
         except Exception:
-            return self.safe_extract(data, "video.play_addr.url_list[0]")
+            url_list = self.safe_extract(data, "video.play_addr.url_list", [])
+            return url_list[-1] if url_list else ""
 
 # ==========================================
 # 4. 下载器核心
