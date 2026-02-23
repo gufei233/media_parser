@@ -6,6 +6,7 @@ import re
 import os
 import asyncio
 import tempfile
+import traceback
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
@@ -220,8 +221,6 @@ class MediaParserPlugin(Star):
                 await dy_downloader.close()
 
         except Exception as e:
-            import traceback
-
             error_msg = f"抖音解析失败: {e}\n{traceback.format_exc()}"
             logger.error(error_msg)
             if self.cfg.show_download_fail_tip:
@@ -233,6 +232,7 @@ class MediaParserPlugin(Star):
 
         # 下载所有图片
         for i, img_url in enumerate(images):
+            temp_path = None
             try:
                 logger.info(f"下载图片 {i+1}/{len(images)}")
 
@@ -257,18 +257,18 @@ class MediaParserPlugin(Star):
                         await event.send(event.plain_result(f"图片下载失败: {img_url}"))
                     logger.warning(f"图片 {i+1} 下载失败")
 
-                # 清理临时文件
-                if os.path.exists(temp_path):
+            except Exception as e:
+                logger.error(f"图片 {i+1} 处理异常: {e}")
+            finally:
+                if temp_path and os.path.exists(temp_path):
                     try:
                         os.unlink(temp_path)
                     except Exception as e:
                         logger.warning(f"清理临时文件失败: {temp_path}, {e}")
 
-            except Exception as e:
-                logger.error(f"图片 {i+1} 处理异常: {e}")
-
         # 下载所有视频
         for i, video_url in enumerate(video_links):
+            temp_path = None
             try:
                 logger.info(f"下载视频 {i+1}/{len(video_links)}")
 
@@ -283,25 +283,32 @@ class MediaParserPlugin(Star):
                 # 延迟发送
                 await asyncio.sleep(3)
 
-                if success and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-                    result = event.make_result()
-                    result.chain = [Comp.Video.fromFileSystem(temp_path)]
-                    await event.send(result)
-                    logger.info(f"视频 {i+1} 发送成功")
+                # 视频文件需要额外验证：文件大小必须大于 10KB
+                min_video_size = 10 * 1024
+                if success and os.path.exists(temp_path):
+                    file_size = os.path.getsize(temp_path)
+                    if file_size >= min_video_size:
+                        result = event.make_result()
+                        result.chain = [Comp.Video.fromFileSystem(temp_path)]
+                        await event.send(result)
+                        logger.info(f"视频 {i+1} 发送成功, 大小: {file_size} bytes")
+                    else:
+                        logger.warning(f"视频 {i+1} 文件过小 ({file_size} bytes)，可能不完整，跳过发送")
+                        if self.cfg.show_download_fail_tip:
+                            await event.send(event.plain_result(f"视频下载不完整，请直接访问链接"))
                 else:
                     if self.cfg.show_download_fail_tip:
                         await event.send(event.plain_result(f"视频链接: {video_url}"))
                     logger.warning(f"视频 {i+1} 下载失败")
 
-                # 清理临时文件
-                if os.path.exists(temp_path):
+            except Exception as e:
+                logger.error(f"视频 {i+1} 处理异常: {e}")
+            finally:
+                if temp_path and os.path.exists(temp_path):
                     try:
                         os.unlink(temp_path)
                     except Exception as e:
                         logger.warning(f"清理临时文件失败: {temp_path}, {e}")
-
-            except Exception as e:
-                logger.error(f"视频 {i+1} 处理异常: {e}")
 
     # ==================== 小红书解析（完全异步）====================
 
@@ -359,8 +366,6 @@ class MediaParserPlugin(Star):
                     yield event.chain_result([Comp.Video.fromURL(video_url)])
 
         except Exception as e:
-            import traceback
-
             error_msg = f"小红书解析失败: {e}\n{traceback.format_exc()}"
             logger.error(error_msg)
             if self.cfg.show_download_fail_tip:

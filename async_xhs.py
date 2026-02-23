@@ -6,6 +6,7 @@ import re
 import json
 import time
 import asyncio
+import traceback
 from urllib.parse import urlparse
 from typing import Optional, Dict
 
@@ -221,7 +222,7 @@ class AsyncXiaohongshuParser:
                         if any(k in str_dump for k in ['video', 'image', 'title', 'WB_']):
                             result['scriptJsonData'].append({'data': parsed})
 
-                    except:
+                    except Exception:
                         pass
         return result
 
@@ -271,7 +272,7 @@ class AsyncXiaohongshuParser:
                 match = re.search(r'type=([^&]+)', query)
                 return match.group(1) if match else None
             return None
-        except:
+        except Exception:
             return None
 
     def has_live_photo_data(self, html):
@@ -282,7 +283,7 @@ class AsyncXiaohongshuParser:
                     parsed = json.loads(json_str)
                     if 'h264' in parsed and isinstance(parsed['h264'], list) and len(parsed['h264']) > 0:
                         return True
-                except:
+                except Exception:
                     pass
         return False
 
@@ -437,7 +438,6 @@ class AsyncXiaohongshuParser:
 
         except Exception as e:
             logger.error(f"小红书解析异常: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             return {'error': True, 'message': str(e)}
 

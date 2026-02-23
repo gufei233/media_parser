@@ -275,7 +275,7 @@ class Extractor:
                     current = current.get(key)
                 if current is None: return default
             return current
-        except:
+        except Exception:
             return default
 
     @staticmethod
@@ -361,7 +361,7 @@ class Extractor:
                 ))
             candidates.sort(key=lambda x: (max(x[3], x[4]), x[0], x[1], x[2]))
             return candidates[-1][-1][0] if candidates and candidates[-1][-1] else ""
-        except:
+        except Exception:
             return self.safe_extract(data, "video.play_addr.url_list[0]")
 
 # ==========================================
