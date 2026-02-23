@@ -331,101 +331,150 @@ class AsyncDouyinDownloader:
         save_path: str = "video.mp4"
     ) -> bool:
         """
-        下载视频或图片（支持CF代理回退）
-        重要：必须使用downloader的session，因为session中包含了cookies
-        虽然抖音CDN的视频/图片链接理论上不需要cookie，但使用session可以保持一致性
+        下载视频或图片（支持断点续传和CF代理回退）
 
         下载策略：
-        1. 先尝试直连下载（3次重试）
+        1. 先尝试直连下载，支持 Range 断点续传（CDN 可能中途断开连接）
         2. 如果全部失败且启用了CF代理，则尝试通过CF Worker代理下载
         """
         session = await self._get_session()
 
-        # 使用 User-Agent、Referer 和 Accept
-        # Accept 头很重要：某些图片服务器会检查客户端是否支持图片格式
-        # 注意：这里确实不应该传递Cookie（参考同步版本dysk.py:526-529）
-        # 但是session本身会自动管理cookies（对于requests.Session来说）
-        # 对于aiohttp，我们需要手动处理
         headers = {
             "User-Agent": USERAGENT,
             "Accept": "image/webp,image/apng,image/*,video/mp4,*/*;q=0.8",
             "Referer": "https://www.douyin.com/",
         }
 
-        # ========== 第一步：尝试直连下载 ==========
-        for attempt in range(self.download_retry_times):
+        # ========== 第一步：尝试直连下载（支持断点续传）==========
+        total_size = 0  # 已下载的总字节数
+        expected_size = None  # 文件总大小（从首次请求获取）
+        max_retries = self.download_retry_times * 3  # 续传允许更多次重试
+
+        logger.info(f"[下载] 开始: {save_path}")
+
+        for attempt in range(max_retries):
             try:
                 if attempt > 0:
-                    logger.info(f"[下载] 重试 {attempt}/{self.download_retry_times}")
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(min(2 * attempt, 10))
 
-                logger.info(f"[下载] 开始: {save_path}")
+                req_headers = dict(headers)
+                file_mode = 'wb'
 
-                # 使用配置的下载超时时间
+                # 如果已有部分数据，使用 Range 请求续传
+                if total_size > 0 and os.path.exists(save_path):
+                    req_headers["Range"] = f"bytes={total_size}-"
+                    file_mode = 'ab'  # 追加模式
+                    logger.info(f"[下载] 续传从 {total_size} bytes 开始 (尝试 {attempt+1}/{max_retries})")
+                elif attempt > 0:
+                    logger.info(f"[下载] 重试 {attempt}/{max_retries}")
+
                 timeout = aiohttp.ClientTimeout(total=self.download_timeout)
 
-                async with session.get(url, headers=headers, ssl=False, timeout=timeout) as resp:
-                    logger.debug(f"[下载] 状态码: {resp.status}")
+                async with session.get(url, headers=req_headers, ssl=False, timeout=timeout) as resp:
+                    status = resp.status
 
-                    if resp.status == 200:
-                        # 检查文件大小限制
-                        content_length = resp.content_length
-                        if content_length and self.max_size:
-                            if content_length > self.max_size:
-                                size_mb = content_length / 1024 / 1024
-                                limit_mb = self.max_size / 1024 / 1024
-                                logger.warning(f"[下载] 文件大小 {size_mb:.2f}MB 超过限制 {limit_mb:.2f}MB")
-                                return False  # 不下载，返回失败
+                    if status == 416:
+                        # Range Not Satisfiable - 文件可能已完整
+                        if total_size > 0:
+                            logger.info(f"[下载] 服务器返回416，文件可能已完整: {total_size} bytes")
+                            return True
+                        logger.error(f"[下载] 失败: HTTP 416")
+                        break
 
-                        total_size = 0
-                        try:
-                            with open(save_path, 'wb') as f:
-                                # 使用较小的块大小，与同步版本一致
-                                async for chunk in resp.content.iter_chunked(8192):
-                                    if chunk:
-                                        f.write(chunk)
-                                        total_size += len(chunk)
+                    if status not in (200, 206):
+                        logger.error(f"[下载] 失败: HTTP {status}")
+                        if status == 403:
+                            # 403 不续传，重置
+                            total_size = 0
+                        continue
 
-                                        # 检查实际下载大小是否超限
-                                        if self.max_size and total_size > self.max_size:
-                                            limit_mb = self.max_size / 1024 / 1024
-                                            logger.warning(f"[下载] 实际大小超过限制 {limit_mb:.2f}MB，停止下载")
-                                            f.close()
-                                            if os.path.exists(save_path):
-                                                os.unlink(save_path)
-                                            return False
+                    # 首次请求（200）时获取文件总大小
+                    if status == 200:
+                        total_size = 0  # 200 表示服务器不支持续传或从头开始
+                        file_mode = 'wb'
+                        expected_size = resp.content_length
+                        if expected_size and self.max_size and expected_size > self.max_size:
+                            size_mb = expected_size / 1024 / 1024
+                            limit_mb = self.max_size / 1024 / 1024
+                            logger.warning(f"[下载] 文件大小 {size_mb:.2f}MB 超过限制 {limit_mb:.2f}MB")
+                            return False
+                    elif status == 206:
+                        # 206 Partial Content - 续传成功
+                        # 尝试从 Content-Range 获取总大小
+                        content_range = resp.headers.get("Content-Range", "")
+                        if "/" in content_range:
+                            try:
+                                expected_size = int(content_range.split("/")[-1])
+                            except (ValueError, IndexError):
+                                pass
 
+                    try:
+                        with open(save_path, file_mode) as f:
+                            async for chunk in resp.content.iter_chunked(65536):
+                                if chunk:
+                                    f.write(chunk)
+                                    total_size += len(chunk)
+
+                                    if self.max_size and total_size > self.max_size:
+                                        limit_mb = self.max_size / 1024 / 1024
+                                        logger.warning(f"[下载] 实际大小超过限制 {limit_mb:.2f}MB，停止下载")
+                                        f.close()
+                                        if os.path.exists(save_path):
+                                            os.unlink(save_path)
+                                        return False
+
+                        # 检查是否下载完整
+                        if expected_size and total_size >= expected_size:
+                            logger.info(f"[下载] 完成: {save_path}, 大小: {total_size} bytes")
+                            return True
+                        elif expected_size:
+                            ratio = total_size / expected_size
+                            if ratio >= 0.95:
+                                logger.info(f"[下载] 近似完成（{ratio:.1%}）: {save_path}, {total_size}/{expected_size} bytes")
+                                return True
+                            else:
+                                logger.warning(f"[下载] 连接断开，已下载 {ratio:.1%} ({total_size}/{expected_size} bytes)，将续传...")
+                                continue  # 继续循环，下次用 Range 续传
+                        else:
+                            # 没有 expected_size，且流正常结束，视为成功
                             logger.info(f"[下载] 完成: {save_path}, 大小: {total_size} bytes")
                             return True
 
-                        except aiohttp.ClientPayloadError as e:
-                            # ContentLengthError: 检查是否下载了足够的数据
-                            if total_size > 0 and content_length:
-                                ratio = total_size / content_length
-                                if ratio >= 0.95:
-                                    # 下载了 95% 以上，视为成功
-                                    logger.warning(f"[下载] 近似完成（{ratio:.1%}）: {save_path}, {total_size}/{content_length} bytes")
-                                    return True
-                                else:
-                                    # 明显不完整，删除文件并重试
-                                    logger.error(f"[下载] 不完整（{ratio:.1%}）: {total_size}/{content_length} bytes, 将重试")
-                                    if os.path.exists(save_path):
-                                        os.unlink(save_path)
-                            elif total_size > 0:
-                                # 没有 Content-Length，无法判断完整性，视为成功
-                                logger.warning(f"[下载] 部分完成（无Content-Length）: {save_path}, 大小: {total_size} bytes")
+                    except aiohttp.ClientPayloadError:
+                        # 连接中断，检查是否需要续传
+                        if expected_size and total_size > 0:
+                            ratio = total_size / expected_size
+                            if ratio >= 0.95:
+                                logger.warning(f"[下载] 近似完成（{ratio:.1%}）: {save_path}, {total_size}/{expected_size} bytes")
                                 return True
-                            else:
-                                logger.error(f"[下载] Payload 错误: {e}")
-                                raise
-
-                    else:
-                        logger.error(f"[下载] 失败: HTTP {resp.status}")
+                            logger.warning(f"[下载] 连接中断（{ratio:.1%}），已下载 {total_size}/{expected_size} bytes，将续传...")
+                            continue
+                        elif total_size > 0:
+                            logger.warning(f"[下载] 连接中断（无总大小），已下载 {total_size} bytes，将续传...")
+                            continue
+                        else:
+                            logger.error(f"[下载] Payload 错误，无数据")
 
             except asyncio.TimeoutError:
-                logger.error(f"[下载] 超时 (尝试 {attempt+1}/{self.download_retry_times})")
+                if total_size > 0 and expected_size:
+                    logger.warning(f"[下载] 超时，已下载 {total_size}/{expected_size} bytes，将续传...")
+                    continue
+                logger.error(f"[下载] 超时 (尝试 {attempt+1}/{max_retries})")
             except Exception as e:
-                logger.error(f"[下载] 异常 (尝试 {attempt+1}/{self.download_retry_times}): {e}")
+                logger.error(f"[下载] 异常 (尝试 {attempt+1}/{max_retries}): {e}")
+                # 异常后重置，从头开始
+                total_size = 0
+
+        # 直连全部失败，检查是否有部分下载的数据可用
+        if total_size > 0 and expected_size:
+            ratio = total_size / expected_size
+            if ratio >= 0.95:
+                logger.warning(f"[下载] 重试耗尽但近似完成（{ratio:.1%}），保留文件")
+                return True
+            else:
+                logger.error(f"[下载] 重试耗尽，仅下载 {ratio:.1%} ({total_size}/{expected_size} bytes)")
+                if os.path.exists(save_path):
+                    os.unlink(save_path)
 
         # ========== 第二步：如果直连失败且启用了CF代理，则尝试代理下载 ==========
         if self.enable_cf_proxy and self.cf_proxy_url:
