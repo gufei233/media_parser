@@ -501,14 +501,10 @@ class AsyncDouyinDownloader:
 
     async def _download_via_cf_proxy(self, url: str, save_path: str) -> bool:
         """
-        通过CF Worker代理下载文件
+        通过CF Worker代理下载文件（流式）
 
-        Args:
-            url: 原始下载URL
-            save_path: 保存路径
-
-        Returns:
-            bool: 是否成功
+        Worker v3 直接流式转发二进制数据，不再 base64 编码。
+        错误时返回 JSON（status != 200），成功时返回二进制流（status 200）。
         """
         session = await self._get_session()
 
@@ -517,13 +513,15 @@ class AsyncDouyinDownloader:
         if not proxy_url.endswith("/download"):
             proxy_url = f"{proxy_url}/download"
 
-        # CF Worker代理请求
+        # CF Worker代理请求（对齐 TikTokDownloader 的下载头）
         proxy_data = {
             "url": url,
             "headers": {
                 "User-Agent": USERAGENT,
-                "Accept": "image/webp,image/apng,image/*,video/mp4,*/*;q=0.8",
-                "Referer": "https://www.douyin.com/",
+                "Accept": "*/*",
+                "Range": "bytes=0-",
+                "Referer": "https://www.douyin.com/?recommend=1",
+                "Cookie": "dy_swidth=1536; dy_sheight=864",
             }
         }
 
@@ -536,42 +534,45 @@ class AsyncDouyinDownloader:
                 json=proxy_data,
                 timeout=timeout
             ) as resp:
-                if resp.status != 200:
-                    logger.error(f"[下载] CF代理返回错误: HTTP {resp.status}")
-                    return False
-
-                # 读取响应
-                resp_data = await resp.json()
-
-                # 检查是否成功
-                if not resp_data.get("success"):
-                    error = resp_data.get("error", "未知错误")
+                # Worker 错误时返回 JSON（status 4xx/5xx）
+                if resp.status >= 400:
+                    try:
+                        err_data = await resp.json()
+                        error = err_data.get("error", f"HTTP {resp.status}")
+                    except Exception:
+                        error = f"HTTP {resp.status}"
                     logger.error(f"[下载] CF代理返回错误: {error}")
                     return False
 
-                # 获取文件内容（可能是base64编码）
-                content = resp_data.get("content")
-                if not content:
-                    logger.error(f"[下载] CF代理返回空内容")
-                    return False
-
-                # 解码
-                try:
-                    file_data = base64.b64decode(content)
-                except Exception:
-                    file_data = content.encode() if isinstance(content, str) else content
-
                 # 检查文件大小限制
-                if self.max_size and len(file_data) > self.max_size:
+                content_length = resp.content_length
+                if content_length and self.max_size and content_length > self.max_size:
                     limit_mb = self.max_size / 1024 / 1024
-                    size_mb = len(file_data) / 1024 / 1024
+                    size_mb = content_length / 1024 / 1024
                     logger.warning(f"[下载] CF代理文件大小 {size_mb:.2f}MB 超过限制 {limit_mb:.2f}MB")
                     return False
 
+                # 流式写入文件
+                total_size = 0
                 with open(save_path, 'wb') as f:
-                    f.write(file_data)
+                    async for chunk in resp.content.iter_chunked(65536):
+                        if chunk:
+                            f.write(chunk)
+                            total_size += len(chunk)
 
-                logger.info(f"[下载] CF代理下载完成: {save_path}, 大小: {len(file_data)} bytes")
+                            if self.max_size and total_size > self.max_size:
+                                limit_mb = self.max_size / 1024 / 1024
+                                logger.warning(f"[下载] CF代理实际大小超限 {limit_mb:.2f}MB，停止")
+                                f.close()
+                                if os.path.exists(save_path):
+                                    os.unlink(save_path)
+                                return False
+
+                if total_size == 0:
+                    logger.error(f"[下载] CF代理返回空内容")
+                    return False
+
+                logger.info(f"[下载] CF代理下载完成: {save_path}, 大小: {total_size} bytes")
                 return True
 
         except asyncio.TimeoutError:
