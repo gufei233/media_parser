@@ -168,3 +168,6 @@ media_parser/
   ↓
 关闭解析器（清理session和CookieJar）
 ```
+
+## 项目参考
+[TikTokDownloader](https://github.com/JoeanAmier/TikTokDownloader)
