@@ -304,6 +304,11 @@ class Extractor:
                 "author": self.safe_extract(data_dict, "music.author"),
                 "title": self.safe_extract(data_dict, "music.title"),
                 "url": self.safe_extract(data_dict, "music.play_url.url_list[0]"),
+                "cover": (
+                    self.safe_extract(data_dict, "music.cover_hd.url_list[0]")
+                    or self.safe_extract(data_dict, "music.cover_large.url_list[0]")
+                    or self.safe_extract(data_dict, "music.cover_thumb.url_list[0]")
+                ),
             }
         }
 

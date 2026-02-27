@@ -40,14 +40,23 @@ async function handleDownload(request) {
     if (!targetUrl) {
       return jsonError("缺少 url 参数", 400);
     }
+    const parsedTargetUrl = parsePublicHttpUrl(targetUrl);
+    if (!parsedTargetUrl) {
+      return jsonError("url 非法或指向内网地址", 400);
+    }
 
     console.log(`[下载代理] 目标URL: ${targetUrl}`);
 
     // 构建请求头
     const headers = new Headers();
-    if (customHeaders) {
+    if (customHeaders && typeof customHeaders === "object") {
+      let headerCount = 0;
       Object.entries(customHeaders).forEach(([key, value]) => {
+        if (headerCount >= 40) return;
+        if (typeof key !== "string" || typeof value !== "string") return;
+        if (key.length > 128 || value.length > 2048) return;
         headers.set(key, value);
+        headerCount += 1;
       });
     }
 
@@ -62,7 +71,7 @@ async function handleDownload(request) {
     }
 
     // 发起下载请求
-    const response = await fetch(targetUrl, {
+    const response = await fetch(parsedTargetUrl.toString(), {
       method: "GET",
       headers: headers,
       redirect: "follow",
@@ -153,8 +162,9 @@ async function handleApiProxy(request, url) {
       redirect: "follow",
     });
 
-    const responseText = await response.text();
-    const base64Data = btoa(unescape(encodeURIComponent(responseText)));
+    // Encode raw response bytes to base64 to avoid charset-side mojibake.
+    const responseBuffer = await response.arrayBuffer();
+    const base64Data = arrayBufferToBase64(responseBuffer);
 
     return new Response(
       JSON.stringify({
@@ -189,4 +199,56 @@ function jsonError(message, status = 500) {
       },
     }
   );
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function parsePublicHttpUrl(raw) {
+  if (typeof raw !== "string" || !raw) return null;
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) return null;
+  if (!parsed.hostname || isPrivateOrLoopbackHost(parsed.hostname)) return null;
+  return parsed;
+}
+
+function isPrivateOrLoopbackHost(hostname) {
+  const host = String(hostname || "").trim().toLowerCase();
+  if (!host) return true;
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (host.endsWith(".local") || host.endsWith(".internal")) return true;
+
+  // IPv4 literal checks.
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+    const parts = host.split(".").map((v) => Number(v));
+    if (parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+    const [a, b] = parts;
+    if (a === 10 || a === 127 || a === 0) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+  }
+
+  // IPv6 literal checks (basic).
+  if (host.includes(":")) {
+    if (host === "::1" || host.startsWith("fe80:") || host.startsWith("fc") || host.startsWith("fd")) {
+      return true;
+    }
+  }
+
+  return false;
 }

@@ -24,6 +24,7 @@
 | `common_timeout` | int | `15` | 普通请求超时时间（秒） |
 | `show_download_fail_tip` | bool | `true` | 是否提示下载失败信息 |
 | `forward_threshold` | int | `3` | 消息合并转发阈值 |
+| `douyin_info_render_mode` | string | `"image"` | 抖音信息渲染模式：`text` / `image` / `both` |
 | `enable_cf_proxy` | bool | `false` | 是否启用 CF 代理 |
 | `cf_proxy_url` | string | `""` | CF Workers 地址 |
 
@@ -37,6 +38,7 @@
   "source_max_minute": 15,
   "download_timeout": 280,
   "download_retry_times": 3,
+  "douyin_info_render_mode": "image",
   "enable_cf_proxy": true,
   "cf_proxy_url": "https://your-worker.workers.dev"
 }

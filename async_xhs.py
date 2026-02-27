@@ -98,6 +98,27 @@ class AsyncXiaohongshuParser:
                    .replace(r'\"', '"')
                    .strip('"'))
 
+    @staticmethod
+    def _is_valid_http_url(url: str) -> bool:
+        if not isinstance(url, str) or not url:
+            return False
+        try:
+            parsed = urlparse(url.strip())
+        except Exception:
+            return False
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    @staticmethod
+    def _decode_html_bytes(raw: bytes) -> str:
+        if not raw:
+            return ""
+        for enc in ("utf-8", "utf-8-sig", "gb18030"):
+            try:
+                return raw.decode(enc)
+            except Exception:
+                continue
+        return raw.decode("utf-8", errors="replace")
+
     # ==================== 内容提取函数 ====================
 
     def extract_title(self, html):
@@ -311,6 +332,9 @@ class AsyncXiaohongshuParser:
 
     async def fetch_with_retry(self, url):
         """异步请求，带重试"""
+        if not self._is_valid_http_url(url):
+            raise Exception(f"URL无效: {url}")
+
         session = await self._get_session()
 
         for attempt in range(self.config['max_retries'] + 1):
@@ -322,10 +346,13 @@ class AsyncXiaohongshuParser:
                     'Cache-Control': 'no-cache'
                 }
 
-                async with session.get(url, headers=headers, allow_redirects=True, ssl=False) as resp:
+                async with session.get(url, headers=headers, allow_redirects=True) as resp:
                     if resp.status != 200:
                         raise Exception(f"HTTP {resp.status}")
-                    html = await resp.text()
+                    if resp.content_length and resp.content_length > 8 * 1024 * 1024:
+                        raise Exception("响应体过大，已拒绝解析")
+                    raw = await resp.read()
+                    html = self._decode_html_bytes(raw)
                     final_url = str(resp.url)
                     return html, final_url
 

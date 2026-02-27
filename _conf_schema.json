@@ -88,6 +88,17 @@
     },
     "default": 3
   },
+  "douyin_info_render_mode": {
+    "description": "抖音信息渲染模式",
+    "hint": "text=文本模式，image=图片模式，both=文本+图片。建议优先使用 image 模式",
+    "type": "string",
+    "options": [
+      "image",
+      "text",
+      "both"
+    ],
+    "default": "image"
+  },
   "enable_cf_proxy": {
     "description": "是否启用 Cloudflare 代理",
     "type": "bool",

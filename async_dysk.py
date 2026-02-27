@@ -12,6 +12,7 @@ import asyncio
 import base64
 import traceback
 from typing import Optional, Dict
+from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import CookieJar
@@ -135,6 +136,79 @@ class AsyncDouyinDownloader:
         # 3. 构建 Cookie 字符串
         return "; ".join([f"{k}={v}" for k, v in cookies_dict.items()])
 
+    @staticmethod
+    def _is_valid_http_url(url: str) -> bool:
+        if not isinstance(url, str) or not url:
+            return False
+        try:
+            parsed = urlparse(url.strip())
+        except Exception:
+            return False
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    @staticmethod
+    def _decode_text_bytes(raw: bytes) -> str:
+        if not raw:
+            return ""
+        for enc in ("utf-8", "utf-8-sig", "gb18030"):
+            try:
+                return raw.decode(enc)
+            except Exception:
+                continue
+        return raw.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _text_mojibake_score(value: Optional[str]) -> int:
+        if not value:
+            return 0
+        text = str(value)
+        markers = (
+            "锛",
+            "銆",
+            "鈥",
+            "鈻",
+            "鎴",
+            "鐨",
+            "鍦",
+            "涓",
+            "鏄",
+            "浣",
+            "鍙",
+            "瀵",
+            "璇",
+            "鎵",
+            "鍒",
+            "绗",
+            "澶",
+            "鍥",
+            "鏂",
+            "鏃",
+            "鍐",
+            "寮",
+            "闂",
+            "閮",
+            "Ã",
+            "Â",
+            "â",
+            "�",
+        )
+        return sum(text.count(ch) for ch in markers)
+
+    @staticmethod
+    def _result_mojibake_score(result: Optional[dict]) -> int:
+        if not isinstance(result, dict):
+            return 0
+        author = result.get("author") or {}
+        music = result.get("music") or {}
+        fields = [
+            result.get("desc"),
+            result.get("type"),
+            author.get("nickname"),
+            music.get("title"),
+            music.get("author"),
+        ]
+        return sum(AsyncDouyinDownloader._text_mojibake_score(v) for v in fields)
+
     async def get_detail(self, url_input: str) -> Optional[dict]:
         """获取视频详情（主入口）"""
         try:
@@ -142,6 +216,9 @@ class AsyncDouyinDownloader:
             await self._init_tokens()
 
             url = url_input.strip()
+            if not self._is_valid_http_url(url):
+                logger.error(f"无效链接: {url_input}")
+                return None
 
             # 1. 解析短链接获取 aweme_id
             aweme_id = await self._resolve_short_url(url)
@@ -172,7 +249,29 @@ class AsyncDouyinDownloader:
             params["a_bogus"] = self.ab.get_value(params)
 
             # 4. 发送 API 请求
-            return await self._fetch_detail_api(aweme_id, params)
+            result = await self._fetch_detail_api(aweme_id, params)
+            if not result:
+                return None
+
+            # CF 详情链路如果疑似乱码，尝试直连重试并择优结果。
+            if self.enable_cf_proxy and self.cf_proxy_url:
+                cf_score = self._result_mojibake_score(result)
+                if cf_score >= 3:
+                    logger.warning(
+                        f"Detected possible mojibake in CF detail response (score={cf_score}), retrying direct API"
+                    )
+                    direct_result = await self._fetch_detail_api(
+                        aweme_id, params, force_direct=True
+                    )
+                    if direct_result:
+                        direct_score = self._result_mojibake_score(direct_result)
+                        if direct_score + 1 < cf_score:
+                            logger.info(
+                                f"Using direct API detail result to avoid mojibake (cf={cf_score}, direct={direct_score})"
+                            )
+                            return direct_result
+
+            return result
 
         except Exception as e:
             logger.error(f"get_detail 异常: {e}")
@@ -187,6 +286,8 @@ class AsyncDouyinDownloader:
         url_match = re.search(r'(https?://\S+)', url)
         if url_match:
             url = url_match.group(1)
+        if not self._is_valid_http_url(url):
+            return None
 
         session = await self._get_session()
 
@@ -208,8 +309,7 @@ class AsyncDouyinDownloader:
                 async with session.head(
                     url,
                     headers=headers,
-                    allow_redirects=True,
-                    ssl=False
+                    allow_redirects=True
                 ) as resp:
                     final_url = str(resp.url)
                     # CookieJar 会自动保存响应中的 cookies
@@ -249,12 +349,14 @@ class AsyncDouyinDownloader:
 
         return None
 
-    async def _fetch_detail_api(self, aweme_id: str, params: dict) -> Optional[dict]:
+    async def _fetch_detail_api(
+        self, aweme_id: str, params: dict, force_direct: bool = False
+    ) -> Optional[dict]:
         """请求详情 API"""
         session = await self._get_session()
 
         # 使用 CF 代理或直连
-        if self.enable_cf_proxy and self.cf_proxy_url:
+        if self.enable_cf_proxy and self.cf_proxy_url and not force_direct:
             api = f"{self.cf_proxy_url}/douyin/aweme/v1/web/aweme/detail/"
         else:
             api = "https://www.douyin.com/aweme/v1/web/aweme/detail/"
@@ -267,7 +369,7 @@ class AsyncDouyinDownloader:
 
         # CF Worker模式需要手动传递Cookie
         # 直连模式不设置Cookie header，让CookieJar自动管理
-        if self.enable_cf_proxy and self.cf_proxy_url:
+        if self.enable_cf_proxy and self.cf_proxy_url and not force_direct:
             headers["Cookie"] = self._get_cookie_string()
             logger.debug(f"API 请求 Cookie 前50字符: {self._get_cookie_string()[:50]}...")
 
@@ -275,7 +377,7 @@ class AsyncDouyinDownloader:
         logger.debug(f"请求参数: aweme_id={aweme_id}, a_bogus={params.get('a_bogus', '')[:20]}...")
 
         try:
-            async with session.get(api, params=params, headers=headers, ssl=False) as resp:
+            async with session.get(api, params=params, headers=headers) as resp:
                 logger.debug(f"API 响应状态: {resp.status}")
                 logger.debug(f"实际请求 URL: {resp.url}")
 
@@ -284,7 +386,8 @@ class AsyncDouyinDownloader:
                 if resp.status == 200:
                     try:
                         # 先读取响应文本，检查是否为空
-                        text = await resp.text()
+                        raw = await resp.read()
+                        text = self._decode_text_bytes(raw)
                         if not text or len(text) == 0:
                             logger.error("API 返回空响应")
                             return None
@@ -292,11 +395,11 @@ class AsyncDouyinDownloader:
                         # 尝试解析 JSON
                         resp_json = json.loads(text)
 
-                        # 如果使用 CF 代理，响应可能被 Base64 编码
-                        if (self.enable_cf_proxy and self.cf_proxy_url and
-                            isinstance(resp_json, dict) and 'encoding' in resp_json):
-                            if resp_json.get('encoding') == 'base64':
-                                decoded_text = base64.b64decode(resp_json['data']).decode('utf-8')
+                        # 代理层可能将响应 Base64 包装为 JSON。
+                        if isinstance(resp_json, dict) and 'encoding' in resp_json:
+                            if resp_json.get('encoding') == 'base64' and isinstance(resp_json.get('data'), str):
+                                decoded_raw = base64.b64decode(resp_json['data'])
+                                decoded_text = self._decode_text_bytes(decoded_raw)
                                 data = json.loads(decoded_text)
                             else:
                                 data = resp_json
@@ -318,7 +421,8 @@ class AsyncDouyinDownloader:
                         return None
                 else:
                     logger.error(f"API 请求失败: HTTP {resp.status}")
-                    text = await resp.text()
+                    raw = await resp.read()
+                    text = self._decode_text_bytes(raw)
                     logger.debug(f"响应内容: {text[:200]}...")
                     return None
         except Exception as e:
@@ -337,6 +441,10 @@ class AsyncDouyinDownloader:
         1. 先尝试直连下载，支持 Range 断点续传（CDN 可能中途断开连接）
         2. 如果全部失败且启用了CF代理，则尝试通过CF Worker代理下载
         """
+        if not self._is_valid_http_url(url):
+            logger.error(f"[下载] 无效URL: {url}")
+            return False
+
         session = await self._get_session()
 
         # 下载请求头（参考 TikTokDownloader）
@@ -380,7 +488,7 @@ class AsyncDouyinDownloader:
 
                 timeout = aiohttp.ClientTimeout(total=self.download_timeout)
 
-                async with session.get(url, headers=req_headers, ssl=False, timeout=timeout) as resp:
+                async with session.get(url, headers=req_headers, timeout=timeout) as resp:
                     status = resp.status
 
                     if status == 416:
@@ -506,10 +614,17 @@ class AsyncDouyinDownloader:
         Worker v3 直接流式转发二进制数据，不再 base64 编码。
         错误时返回 JSON（status != 200），成功时返回二进制流（status 200）。
         """
+        if not self._is_valid_http_url(url):
+            logger.error(f"[下载] CF代理目标URL无效: {url}")
+            return False
+
         session = await self._get_session()
 
         # 确保 CF Worker URL 以 /download 结尾
         proxy_url = self.cf_proxy_url.rstrip("/")
+        if not self._is_valid_http_url(proxy_url):
+            logger.error(f"[下载] CF代理地址无效: {self.cf_proxy_url}")
+            return False
         if not proxy_url.endswith("/download"):
             proxy_url = f"{proxy_url}/download"
 
