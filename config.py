@@ -52,10 +52,6 @@ class MediaParserConfig:
         return bool(self.config.get("show_download_fail_tip", True))
 
     @property
-    def forward_threshold(self):
-        return self._to_int(self.config.get("forward_threshold", 3), 3, 0, 50)
-
-    @property
     def enable_cf_proxy(self):
         return bool(self.config.get("enable_cf_proxy", False))
 

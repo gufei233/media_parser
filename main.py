@@ -21,11 +21,13 @@ try:
     from .debounce import Debouncer
     from .async_dysk import AsyncDouyinDownloader
     from .async_xhs import AsyncXiaohongshuParser
+    from .utils import normalize_text
 except ImportError:
     from config import MediaParserConfig
     from debounce import Debouncer
     from async_dysk import AsyncDouyinDownloader
     from async_xhs import AsyncXiaohongshuParser
+    from utils import normalize_text
 
 
 DOUYIN_INFO_CARD_TEMPLATE = """
@@ -342,7 +344,7 @@ DOUYIN_INFO_CARD_TEMPLATE = """
 """
 
 
-@register("media_parser", "Author", "抖音小红书链接解析插件（异步优化版）", "2.2.0")
+@register("media_parser", "Author", "抖音小红书链接解析插件（异步优化版）", "2.3.0")
 class MediaParserPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -350,14 +352,24 @@ class MediaParserPlugin(Star):
         self.cfg = MediaParserConfig(config)
         # Debouncer
         self.debouncer = Debouncer(lambda: self.cfg.debounce_interval)
-        # Parsers
+        # Parsers - reusable instance
         self.xhs_parser = AsyncXiaohongshuParser()
+        self.dy_downloader = AsyncDouyinDownloader(
+            enable_cf_proxy=self.cfg.enable_cf_proxy,
+            cf_proxy_url=self.cfg.cf_proxy_url,
+            download_retry_times=self.cfg.download_retry_times,
+            download_timeout=self.cfg.download_timeout,
+            common_timeout=self.cfg.common_timeout,
+            max_size=self.cfg.max_size,
+            max_duration=self.cfg.max_duration,
+        )
         self._font_urls = self._build_local_font_urls()
         # URL patterns
         self.dy_patterns = [
             r"https?://v\.douyin\.com/[a-zA-Z0-9_-]+/?",
-            r"https?://(?:www\.)?douyin\.com/[^\s]+",
-            r"https?://(?:www\.)?iesdouyin\.com/[^\s]+",
+            r"https?://(?:www\.)?douyin\.com/(?:video|note|slides)/\d+[^\s]*",
+            r"https?://(?:www\.)?douyin\.com/[^\s]*(?:modal_id|mid|aweme_id)=\d+[^\s]*",
+            r"https?://(?:www\.)?iesdouyin\.com/(?:share/video|share/slides)/\d+[^\s]*",
         ]
         self.xhs_patterns = [
             r"https?://(?:www\.)?xiaohongshu\.com/[^\s]+",
@@ -373,14 +385,28 @@ class MediaParserPlugin(Star):
         if self._font_urls:
             logger.info("已加载本地 HarmonyOS 字体资源")
 
+    def _sync_downloader_config(self):
+        """Sync latest config values to the reusable downloader instance."""
+        self.dy_downloader.update_config(
+            enable_cf_proxy=self.cfg.enable_cf_proxy,
+            cf_proxy_url=self.cfg.cf_proxy_url,
+            download_retry_times=self.cfg.download_retry_times,
+            download_timeout=self.cfg.download_timeout,
+            common_timeout=self.cfg.common_timeout,
+            max_size=self.cfg.max_size,
+            max_duration=self.cfg.max_duration,
+        )
+
     async def terminate(self):
         """Release parser resources on plugin unload."""
         logger.info("正在清理资源...")
         if self.xhs_parser:
             await self.xhs_parser.close()
+        if self.dy_downloader:
+            await self.dy_downloader.close()
         logger.info("资源清理完成")
 
-    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.on_message()
     async def parse_media_link(self, event: AstrMessageEvent):
         """媒体链接解析入口"""
         # Session whitelist check
@@ -433,83 +459,72 @@ class MediaParserPlugin(Star):
         try:
             logger.info(f"Start parsing Douyin link: {url}")
 
-            # Create a new downloader per request to avoid session reuse issues.
-            dy_downloader = AsyncDouyinDownloader(
-                enable_cf_proxy=self.cfg.enable_cf_proxy,
-                cf_proxy_url=self.cfg.cf_proxy_url,
-                download_retry_times=self.cfg.download_retry_times,
-                download_timeout=self.cfg.download_timeout,
-                common_timeout=self.cfg.common_timeout,
-                max_size=self.cfg.max_size,
-                max_duration=self.cfg.max_duration,
-            )
+            # Sync config in case user changed settings at runtime.
+            self._sync_downloader_config()
+            dy_downloader = self.dy_downloader
 
-            try:
-                result = await dy_downloader.get_detail(url)
+            result = await dy_downloader.get_detail(url)
 
-                if not result:
-                    logger.error("Douyin parse returned None")
-                    yield event.plain_result(f"Parse failed. Open link directly:\n{url}")
-                    return
+            if not result:
+                logger.error("Douyin parse returned None")
+                yield event.plain_result(f"Parse failed. Open link directly:\n{url}")
+                return
 
-                uin = event.get_sender_id()
-                name = event.get_sender_name()
+            uin = event.get_sender_id()
+            name = event.get_sender_name()
 
-                downloads = result.get("downloads", [])
-                images, video_links = self._extract_douyin_media(downloads)
-                media_bytes_cache: Dict[str, bytes] = {}
+            downloads = result.get("downloads", [])
+            images, video_links = self._extract_douyin_media(downloads)
+            media_bytes_cache: Dict[str, bytes] = {}
 
-                # Info render mode: text / image / both
-                render_mode = self.cfg.douyin_info_render_mode
-                if render_mode in {"image", "both"}:
-                    info_image_url = await self._render_douyin_info_image(
-                        result=result,
-                        image_count=len(images),
-                        video_count=len(video_links),
-                        dy_downloader=dy_downloader,
-                        media_bytes_cache=media_bytes_cache,
+            # Info render mode: text / image / both
+            render_mode = self.cfg.douyin_info_render_mode
+            if render_mode in {"image", "both"}:
+                info_image_url = await self._render_douyin_info_image(
+                    result=result,
+                    image_count=len(images),
+                    video_count=len(video_links),
+                    dy_downloader=dy_downloader,
+                    media_bytes_cache=media_bytes_cache,
+                )
+                if info_image_url:
+                    yield event.image_result(info_image_url)
+                elif render_mode == "image":
+                    logger.warning(
+                        "Douyin info image render failed, falling back to text mode"
                     )
-                    if info_image_url:
-                        yield event.image_result(info_image_url)
-                    elif render_mode == "image":
-                        logger.warning(
-                            "Douyin info image render failed, falling back to text mode"
-                        )
-                        nodes = self._build_douyin_info_nodes(result, uin, name)
-                        yield event.chain_result([Comp.Nodes(nodes=nodes)])
-
-                if render_mode in {"text", "both"}:
                     nodes = self._build_douyin_info_nodes(result, uin, name)
                     yield event.chain_result([Comp.Nodes(nodes=nodes)])
 
-                # Duration limit check
-                duration_seconds = result.get("duration_seconds", 0)
-                if duration_seconds > 0:
-                    if self.cfg.max_duration and duration_seconds > self.cfg.max_duration:
-                        max_minutes = self.cfg.max_duration / 60
-                        actual_minutes = duration_seconds / 60
-                        warning_msg = (
-                            f"Video duration {actual_minutes:.1f} min exceeds limit "
-                            f"{max_minutes:.1f} min. Skip video download."
-                        )
-                        logger.warning(warning_msg)
-                        if self.cfg.show_download_fail_tip:
-                            yield event.plain_result(warning_msg)
-                        return
+            if render_mode in {"text", "both"}:
+                nodes = self._build_douyin_info_nodes(result, uin, name)
+                yield event.chain_result([Comp.Nodes(nodes=nodes)])
 
-                logger.info(
-                    f"Ready to send media: {len(images)} images, {len(video_links)} videos"
-                )
-
-                if images or video_links:
-                    await self._send_media_async(
-                        event, dy_downloader, images, video_links, media_bytes_cache
+            # Duration limit check
+            duration_seconds = result.get("duration_seconds", 0)
+            if duration_seconds > 0:
+                if self.cfg.max_duration and duration_seconds > self.cfg.max_duration:
+                    max_minutes = self.cfg.max_duration / 60
+                    actual_minutes = duration_seconds / 60
+                    warning_msg = (
+                        f"Video duration {actual_minutes:.1f} min exceeds limit "
+                        f"{max_minutes:.1f} min. Skip video download."
                     )
-                else:
-                    logger.warning("No media file available to send")
+                    logger.warning(warning_msg)
+                    if self.cfg.show_download_fail_tip:
+                        yield event.plain_result(warning_msg)
+                    return
 
-            finally:
-                await dy_downloader.close()
+            logger.info(
+                f"Ready to send media: {len(images)} images, {len(video_links)} videos"
+            )
+
+            if images or video_links:
+                await self._send_media_async(
+                    event, dy_downloader, images, video_links, media_bytes_cache
+                )
+            else:
+                logger.warning("No media file available to send")
 
         except Exception as e:
             error_msg = f"Douyin parse failed: {e}\n{traceback.format_exc()}"
@@ -518,143 +533,8 @@ class MediaParserPlugin(Star):
                 yield event.plain_result(f"Parse failed: {str(e)}")
 
     @staticmethod
-    def _count_cjk(text: str) -> int:
-        return len(re.findall(r"[\u4e00-\u9fff]", text))
-
-    @staticmethod
-    def _mojibake_score(text: str) -> int:
-        if not text:
-            return 0
-        markers = (
-            "Ã",
-            "Â",
-            "â",
-            "å",
-            "ä",
-            "ç",
-            "é",
-            "è",
-            "ê",
-            "ë",
-            "ì",
-            "í",
-            "î",
-            "ï",
-            "ð",
-            "ñ",
-            "ò",
-            "ó",
-            "ô",
-            "õ",
-            "ö",
-            "ù",
-            "ú",
-            "û",
-            "ü",
-            "ý",
-            "þ",
-            "€",
-            "™",
-            " ",
-        )
-        return sum(text.count(ch) for ch in markers)
-
-    @staticmethod
-    def _gbk_mojibake_score(text: str) -> int:
-        if not text:
-            return 0
-        markers = (
-            "锛",
-            "銆",
-            "鈥",
-            "鈻",
-            "鎴",
-            "鐨",
-            "鍦",
-            "涓",
-            "鏄",
-            "浣",
-            "鍙",
-            "瀵",
-            "璇",
-            "鎵",
-            "鍒",
-            "绗",
-            "澶",
-            "鍥",
-            "鏂",
-            "鏃",
-            "鍐",
-            "寮",
-            "闂",
-            "閮",
-        )
-        return sum(text.count(ch) for ch in markers)
-
-    @staticmethod
-    def _common_cjk_score(text: str) -> int:
-        if not text:
-            return 0
-        common = set(
-            "的一是不了人我在有他这为之大来以个中上们到说国和地也子时道出而要于就下得可你年生会那后能对着事其里所去行过家十用发天如然作方成者多日都三小军二无同么经当起与好看学进种将还分此心前面又定见只主没公从知全工"
-        )
-        return sum(1 for ch in text if ch in common)
-
-    @staticmethod
-    def _text_quality(text: str) -> Tuple[int, int, int, int]:
-        cjk = MediaParserPlugin._count_cjk(text)
-        common = MediaParserPlugin._common_cjk_score(text)
-        latin_bad = MediaParserPlugin._mojibake_score(text)
-        gbk_bad = MediaParserPlugin._gbk_mojibake_score(text)
-        bad = latin_bad * 2 + gbk_bad * 3 + text.count(" ") * 4
-        quality = common * 4 + cjk - bad
-        return quality, cjk, common, bad
-
-    @staticmethod
-    def _repair_mojibake_text(text: str) -> str:
-        """Try to recover mojibake text from common wrong decoding paths."""
-        if not text:
-            return text
-
-        best = text
-        best_quality = MediaParserPlugin._text_quality(text)
-        if (
-            MediaParserPlugin._mojibake_score(text) == 0
-            and MediaParserPlugin._gbk_mojibake_score(text) == 0
-        ):
-            return text
-
-        for source_enc in ("latin1", "cp1252", "gb18030", "gbk"):
-            try:
-                candidate = text.encode(source_enc).decode("utf-8")
-            except Exception:
-                continue
-
-            # Some payloads are double-garbled; try one extra pass.
-            try:
-                second = candidate.encode(source_enc).decode("utf-8")
-                if MediaParserPlugin._text_quality(second)[0] > MediaParserPlugin._text_quality(candidate)[0]:
-                    candidate = second
-            except Exception:
-                pass
-
-            cand_quality = MediaParserPlugin._text_quality(candidate)
-            if cand_quality[0] >= best_quality[0] + 2 or (
-                cand_quality[0] > best_quality[0] and cand_quality[3] < best_quality[3]
-            ):
-                best = candidate
-                best_quality = cand_quality
-
-        return best
-
-    @staticmethod
     def _normalize_text(value: Any, default: str = "") -> str:
-        if value is None:
-            return default
-        text = MediaParserPlugin._repair_mojibake_text(str(value))
-        text = text.replace("\r", " ").replace("\n", " ").strip()
-        text = re.sub(r"\s+", " ", text)
-        return text or default
+        return normalize_text(value, default)
 
     @staticmethod
     def _format_count(value: Any) -> str:
@@ -895,16 +775,9 @@ class MediaParserPlugin(Star):
                 base64_str = base64.b64encode(cached_bytes).decode("ascii")
                 return f"data:{mime};base64,{base64_str}"
 
-        temp_path = None
         try:
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-            temp_path = temp_file.name
-            temp_file.close()
-
-            success = await dy_downloader.download_video(source_url, temp_path)
-            if success and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-                with open(temp_path, "rb") as f:
-                    raw = f.read()
+            raw = await dy_downloader.download_to_bytes(source_url)
+            if raw:
                 if media_bytes_cache is not None:
                     media_bytes_cache[source_url] = raw
                 mime = self._detect_image_mime(raw)
@@ -912,12 +785,6 @@ class MediaParserPlugin(Star):
                 return f"data:{mime};base64,{base64_str}"
         except Exception as e:
             logger.debug(f"Failed to convert resource to data URL, fallback URL: {source_url}, error: {e}")
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except Exception:
-                    pass
 
         return source_url
 
@@ -1160,66 +1027,91 @@ class MediaParserPlugin(Star):
         video_links,
         media_bytes_cache: Optional[Dict[str, bytes]] = None,
     ):
-        """Download and send media files asynchronously."""
+        """Download and send media files asynchronously with concurrent image downloads."""
         logger.info(
             f"Start sending media files: {len(images)} images, {len(video_links)} videos"
         )
 
-        # Download images
-        for i, img_url in enumerate(images):
-            temp_path = None
-            try:
-                logger.info(f"Downloading image {i+1}/{len(images)}")
+        # --- Concurrent image download ---
+        sem = asyncio.Semaphore(4)
+
+        async def _download_image(img_url: str) -> Optional[str]:
+            """Download a single image; returns temp file path or None."""
+            async with sem:
+                # Reuse cache first to avoid duplicate downloads.
+                if media_bytes_cache and img_url in media_bytes_cache:
+                    raw = media_bytes_cache.get(img_url, b"")
+                    if raw:
+                        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                        temp_path = temp_file.name
+                        temp_file.close()
+                        with open(temp_path, "wb") as f:
+                            f.write(raw)
+                        return temp_path
 
                 temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
                 temp_path = temp_file.name
                 temp_file.close()
 
-                success = False
-                # Reuse cache first to avoid duplicate downloads.
-                if media_bytes_cache and img_url in media_bytes_cache:
-                    raw = media_bytes_cache.get(img_url, b"")
-                    if raw:
-                        with open(temp_path, "wb") as f:
-                            f.write(raw)
-                        success = True
-
-                if not success:
-                    success = await dy_downloader.download_video(img_url, temp_path)
-                    if (
-                        success
-                        and media_bytes_cache is not None
-                        and os.path.exists(temp_path)
-                        and os.path.getsize(temp_path) > 0
-                    ):
+                success = await dy_downloader.download_video(img_url, temp_path)
+                if (
+                    success
+                    and os.path.exists(temp_path)
+                    and os.path.getsize(temp_path) > 0
+                ):
+                    if media_bytes_cache is not None:
                         try:
                             with open(temp_path, "rb") as f:
                                 media_bytes_cache[img_url] = f.read()
                         except Exception:
                             pass
+                    return temp_path
 
-                await asyncio.sleep(2)
+                # Cleanup on failure
+                if os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except Exception:
+                        pass
+                return None
 
-                if success and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+        # Kick off all image downloads concurrently
+        image_tasks = [_download_image(url) for url in images]
+        image_results = await asyncio.gather(*image_tasks, return_exceptions=True)
+
+        # Collect successfully downloaded image paths (preserve order)
+        image_paths: List[Optional[str]] = []
+        for idx, res in enumerate(image_results):
+            if isinstance(res, Exception):
+                logger.error(f"Image {idx+1} download exception: {res}")
+                image_paths.append(None)
+            else:
+                image_paths.append(res)
+
+        # Send images sequentially (preserves order for the user)
+        for i, temp_path in enumerate(image_paths):
+            try:
+                if temp_path and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
                     result = event.make_result()
                     result.chain = [Comp.Image.fromFileSystem(temp_path)]
                     await event.send(result)
                     logger.info(f"Image {i+1} sent successfully")
                 else:
                     if self.cfg.show_download_fail_tip:
-                        await event.send(event.plain_result(f"Image download failed: {img_url}"))
+                        await event.send(event.plain_result(f"Image download failed: {images[i]}"))
                     logger.warning(f"Image {i+1} download failed")
-
             except Exception as e:
-                logger.error(f"Image {i+1} processing error: {e}")
+                logger.error(f"Image {i+1} send error: {e}")
             finally:
                 if temp_path and os.path.exists(temp_path):
+                    # Brief delay so the framework can finish reading the file
+                    await asyncio.sleep(0.5)
                     try:
                         os.unlink(temp_path)
                     except Exception as e:
                         logger.warning(f"Failed to cleanup temp file: {temp_path}, {e}")
 
-        # Download videos
+        # --- Download and send videos sequentially ---
         for i, video_url in enumerate(video_links):
             temp_path = None
             try:
@@ -1230,8 +1122,6 @@ class MediaParserPlugin(Star):
                 temp_file.close()
 
                 success = await dy_downloader.download_video(video_url, temp_path)
-
-                await asyncio.sleep(3)
 
                 # Video file should be at least 10KB.
                 min_video_size = 10 * 1024
@@ -1261,6 +1151,7 @@ class MediaParserPlugin(Star):
                 logger.error(f"Video {i+1} processing error: {e}")
             finally:
                 if temp_path and os.path.exists(temp_path):
+                    await asyncio.sleep(0.5)
                     try:
                         os.unlink(temp_path)
                     except Exception as e:

@@ -10,6 +10,7 @@ import random
 import string
 import asyncio
 import base64
+import time
 import traceback
 from typing import Optional, Dict
 from urllib.parse import urlparse
@@ -21,12 +22,17 @@ from astrbot.api import logger
 # 从同步版本导入 ABogus 和 Extractor
 try:
     from .dysk import ABogus, Extractor, USERAGENT
+    from .utils import result_mojibake_score, decode_text_bytes
 except ImportError:
     from dysk import ABogus, Extractor, USERAGENT
+    from utils import result_mojibake_score, decode_text_bytes
+
+# Token 有效期（秒），超过后重新初始化
+_TOKEN_TTL = 1800
 
 
 class AsyncDouyinDownloader:
-    """异步抖音下载器 - 特别注意 Cookie 传递"""
+    """异步抖音下载器 - 支持实例复用"""
 
     def __init__(
         self,
@@ -50,20 +56,38 @@ class AsyncDouyinDownloader:
         self.max_size = max_size  # 字节
         self.max_duration = max_duration  # 秒
 
-        # ========== Cookie 管理（关键修复）==========
-        # 使用 aiohttp 的 CookieJar 来自动管理 cookies
-        self._cookie_jar = CookieJar(unsafe=True)  # unsafe=True 允许跨域cookie
-        self._cookies: Dict[str, str] = {}  # 用于手动传递给CF Worker
+        # ========== Cookie 管理 ==========
+        self._cookie_jar = CookieJar(unsafe=True)
+        self._cookies: Dict[str, str] = {}
 
         # Session 延迟创建
         self._session: Optional[aiohttp.ClientSession] = None
         self._initialized = False
+        self._init_time: float = 0
+
+    def update_config(
+        self,
+        enable_cf_proxy: bool,
+        cf_proxy_url: str,
+        download_retry_times: int,
+        download_timeout: int,
+        common_timeout: int,
+        max_size: Optional[int],
+        max_duration: Optional[int],
+    ):
+        """Update runtime config without recreating the instance."""
+        self.enable_cf_proxy = enable_cf_proxy
+        self.cf_proxy_url = cf_proxy_url.rstrip("/") if cf_proxy_url else ""
+        self.download_retry_times = download_retry_times
+        self.download_timeout = download_timeout
+        self.common_timeout = common_timeout
+        self.max_size = max_size
+        self.max_duration = max_duration
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建 session - 使用 CookieJar 自动管理 cookies"""
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=30)
-            # 创建session时传入cookie_jar，让aiohttp自动管理cookies
+            timeout = aiohttp.ClientTimeout(total=self.common_timeout)
             self._session = aiohttp.ClientSession(
                 timeout=timeout,
                 cookie_jar=self._cookie_jar
@@ -74,12 +98,19 @@ class AsyncDouyinDownloader:
         """关闭 session"""
         if self._session and not self._session.closed:
             await self._session.close()
+        self._session = None
+        self._initialized = False
+
+    async def _ensure_tokens(self):
+        """确保 token 已初始化且未过期，过期则重新获取"""
+        now = time.monotonic()
+        if self._initialized and (now - self._init_time) < _TOKEN_TTL:
+            return
+        # Token 过期或首次初始化
+        await self._init_tokens()
 
     async def _init_tokens(self):
         """初始化 tokens（msToken 和 ttwid）"""
-        if self._initialized:
-            return
-
         logger.info("正在初始化 (获取 ttwid/msToken)...")
 
         # 1. 生成 msToken
@@ -110,7 +141,6 @@ class AsyncDouyinDownloader:
         try:
             async with session.post(url, json=data) as resp:
                 if resp.status == 200:
-                    # CookieJar 会自动保存响应中的 cookies（如 ttwid）
                     logger.info("ttwid 初始化成功")
                 else:
                     logger.warning(f"初始化 ttwid 失败: HTTP {resp.status}")
@@ -118,6 +148,7 @@ class AsyncDouyinDownloader:
             logger.warning(f"初始化 ttwid 异常: {e}")
 
         self._initialized = True
+        self._init_time = time.monotonic()
 
     def _get_cookie_string(self) -> str:
         """
@@ -146,74 +177,11 @@ class AsyncDouyinDownloader:
             return False
         return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
-    @staticmethod
-    def _decode_text_bytes(raw: bytes) -> str:
-        if not raw:
-            return ""
-        for enc in ("utf-8", "utf-8-sig", "gb18030"):
-            try:
-                return raw.decode(enc)
-            except Exception:
-                continue
-        return raw.decode("utf-8", errors="replace")
-
-    @staticmethod
-    def _text_mojibake_score(value: Optional[str]) -> int:
-        if not value:
-            return 0
-        text = str(value)
-        markers = (
-            "锛",
-            "銆",
-            "鈥",
-            "鈻",
-            "鎴",
-            "鐨",
-            "鍦",
-            "涓",
-            "鏄",
-            "浣",
-            "鍙",
-            "瀵",
-            "璇",
-            "鎵",
-            "鍒",
-            "绗",
-            "澶",
-            "鍥",
-            "鏂",
-            "鏃",
-            "鍐",
-            "寮",
-            "闂",
-            "閮",
-            "Ã",
-            "Â",
-            "â",
-            "�",
-        )
-        return sum(text.count(ch) for ch in markers)
-
-    @staticmethod
-    def _result_mojibake_score(result: Optional[dict]) -> int:
-        if not isinstance(result, dict):
-            return 0
-        author = result.get("author") or {}
-        music = result.get("music") or {}
-        fields = [
-            result.get("desc"),
-            result.get("type"),
-            author.get("nickname"),
-            music.get("title"),
-            music.get("author"),
-        ]
-        return sum(AsyncDouyinDownloader._text_mojibake_score(v) for v in fields)
-
     async def get_detail(self, url_input: str) -> Optional[dict]:
         """获取视频详情（主入口）"""
         try:
             # 确保已初始化
-            await self._init_tokens()
+            await self._ensure_tokens()
 
             url = url_input.strip()
             if not self._is_valid_http_url(url):
@@ -255,7 +223,7 @@ class AsyncDouyinDownloader:
 
             # CF 详情链路如果疑似乱码，尝试直连重试并择优结果。
             if self.enable_cf_proxy and self.cf_proxy_url:
-                cf_score = self._result_mojibake_score(result)
+                cf_score = result_mojibake_score(result)
                 if cf_score >= 3:
                     logger.warning(
                         f"Detected possible mojibake in CF detail response (score={cf_score}), retrying direct API"
@@ -264,7 +232,7 @@ class AsyncDouyinDownloader:
                         aweme_id, params, force_direct=True
                     )
                     if direct_result:
-                        direct_score = self._result_mojibake_score(direct_result)
+                        direct_score = result_mojibake_score(direct_result)
                         if direct_score + 1 < cf_score:
                             logger.info(
                                 f"Using direct API detail result to avoid mojibake (cf={cf_score}, direct={direct_score})"
@@ -387,7 +355,7 @@ class AsyncDouyinDownloader:
                     try:
                         # 先读取响应文本，检查是否为空
                         raw = await resp.read()
-                        text = self._decode_text_bytes(raw)
+                        text = decode_text_bytes(raw)
                         if not text or len(text) == 0:
                             logger.error("API 返回空响应")
                             return None
@@ -399,7 +367,7 @@ class AsyncDouyinDownloader:
                         if isinstance(resp_json, dict) and 'encoding' in resp_json:
                             if resp_json.get('encoding') == 'base64' and isinstance(resp_json.get('data'), str):
                                 decoded_raw = base64.b64decode(resp_json['data'])
-                                decoded_text = self._decode_text_bytes(decoded_raw)
+                                decoded_text = decode_text_bytes(decoded_raw)
                                 data = json.loads(decoded_text)
                             else:
                                 data = resp_json
@@ -422,12 +390,32 @@ class AsyncDouyinDownloader:
                 else:
                     logger.error(f"API 请求失败: HTTP {resp.status}")
                     raw = await resp.read()
-                    text = self._decode_text_bytes(raw)
+                    text = decode_text_bytes(raw)
                     logger.debug(f"响应内容: {text[:200]}...")
                     return None
         except Exception as e:
             logger.error(f"API 请求异常: {e}")
             return None
+
+    async def download_to_bytes(self, url: str) -> Optional[bytes]:
+        """Download a URL directly into memory, returning bytes or None."""
+        if not self._is_valid_http_url(url):
+            return None
+        session = await self._get_session()
+        headers = {
+            "User-Agent": USERAGENT,
+            "Accept": "*/*",
+            "Referer": "https://www.douyin.com/?recommend=1",
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=self.common_timeout)
+            async with session.get(url, headers=headers, timeout=timeout) as resp:
+                if resp.status in (200, 206):
+                    return await resp.read()
+                logger.debug(f"[download_to_bytes] HTTP {resp.status} for {url}")
+        except Exception as e:
+            logger.debug(f"[download_to_bytes] failed: {e}")
+        return None
 
     async def download_video(
         self,
