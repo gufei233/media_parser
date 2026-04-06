@@ -563,16 +563,20 @@ class MediaParserPlugin(Star):
         stat_item_width = max(44, min(int(round(76 * base)), int(round(stat_item_width_limit))))
 
         meta_font_size = max(19, min(24, int(round(23 * base))))
-        desc_font_size = max(26, min(38, int(round(card_width * 0.043))))
+        desc_font_size = max(26, min(34, int(round(card_width * 0.036))))
 
-        # Keep portrait bottom controls unchanged while enlarging landscape.
+        # Scale bottom section proportionally with aspect ratio.
+        # Portrait cards keep UI compact; landscape cards enlarge slightly
+        # but cap at 1.25 to avoid oversized bottom elements.
         aspect = card_width / max(1, card_height)
-        if aspect >= 1.5:
-            bottom_scale = 1.65
-        elif aspect >= 1.15:
-            bottom_scale = 1.0
+        if aspect <= 0.75:
+            bottom_scale = 0.92
+        elif aspect <= 1.15:
+            # Linear from 0.92 to 1.0
+            bottom_scale = 0.92 + (aspect - 0.75) / (1.15 - 0.75) * 0.08
         else:
-            bottom_scale = 0.95
+            # Linear from 1.0 to 1.25, capped
+            bottom_scale = min(1.25, 1.0 + (aspect - 1.15) / (2.0 - 1.15) * 0.25)
 
         return {
             "avatar_size": avatar_size,
