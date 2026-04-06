@@ -7,11 +7,13 @@ import json
 import time
 import asyncio
 import traceback
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from typing import Optional, Dict
 
 import aiohttp
 from astrbot.api import logger
+
+from .xhs_api_client import XhsApiClient
 
 
 class AsyncXiaohongshuParser:
@@ -67,6 +69,8 @@ class AsyncXiaohongshuParser:
 
         # Session 延迟创建
         self._session: Optional[aiohttp.ClientSession] = None
+        # API 客户端（无水印，主路径）
+        self._api_client: Optional[XhsApiClient] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建 session"""
@@ -79,6 +83,9 @@ class AsyncXiaohongshuParser:
         """关闭 session"""
         if self._session and not self._session.closed:
             await self._session.close()
+        if self._api_client:
+            await self._api_client.close()
+            self._api_client = None
 
     # ==================== 工具函数 ====================
 
@@ -164,6 +171,29 @@ class AsyncXiaohongshuParser:
                 return match.group(1)
         return ''
 
+    @staticmethod
+    def _extract_nowatermark_url(url: str) -> str:
+        """从移动端 CDN URL 中提取图片 ID，构造无水印 URL。
+
+        移动端格式: http://sns-webpic-qc.xhscdn.com/DATE/SIGN/IMAGE_ID!suffix
+        无水印格式: https://sns-img-qc.xhscdn.com/IMAGE_ID
+        """
+        # 去掉 !suffix
+        clean = url.split('!')[0] if '!' in url else url
+        # 提取最后一段路径作为 image_id（可能带子目录如 notes_pre_post/ID）
+        try:
+            from urllib.parse import urlparse as _urlparse
+            path = _urlparse(clean).path
+            # 路径格式: /DATE/SIGN/IMAGE_ID  或  /DATE/SIGN/notes_pre_post/IMAGE_ID
+            parts = path.strip('/').split('/')
+            if len(parts) >= 3:
+                # 取最后1-2段（可能有子目录）
+                image_path = '/'.join(parts[2:])  # 跳过 DATE 和 SIGN
+                return f"https://sns-img-qc.xhscdn.com/{image_path}"
+        except Exception:
+            pass
+        return url
+
     def extract_images(self, html):
         images = []
         # 方式1：从 og:image meta 标签提取（桌面端 SSR 页面）
@@ -179,12 +209,14 @@ class AsyncXiaohongshuParser:
         # 这些才是当前笔记的图片，而非页面底部推荐流的图片
         if not images:
             carousel_imgs = re.findall(
-                r'class="onix-carousel-item"[^>]*>.*?<img[^>]*src=["\']([^"\']+)["\']',
+                r'class="onix-carousel-item"[^>]*>.*?<img[^>]*src=["\']([^"\'\s]+)["\']',
                 html, re.DOTALL
             )
             for url in carousel_imgs:
-                if url not in images:
-                    images.append(url)
+                # 转换为无水印 URL
+                nowm_url = self._extract_nowatermark_url(url)
+                if nowm_url not in images:
+                    images.append(nowm_url)
 
         return images
 
@@ -360,6 +392,161 @@ class AsyncXiaohongshuParser:
         """检测是否落入 404 页面"""
         return '/404' in final_url or 'errorCode=' in final_url
 
+    async def resolve_short_link(self, url: str) -> tuple[str | None, str | None, str | None]:
+        """解析短链，提取 note_id 和 xsec_token。
+
+        返回 (note_id, xsec_token, final_url)。
+        使用移动端 UA 跟随重定向获得最终 URL。
+        """
+        session = await self._get_session()
+        headers = self._build_headers()
+        try:
+            async with session.get(url, headers=headers, allow_redirects=True) as resp:
+                final_url = str(resp.url)
+        except Exception as e:
+            logger.warning(f"解析短链失败: {e}")
+            return None, None, None
+
+        # 从 URL 提取 note_id
+        note_id = None
+        for pattern in self.patterns['note_id']:
+            m = pattern.search(final_url)
+            if m:
+                note_id = m.group(1)
+                break
+
+        # 提取 xsec_token
+        xsec_token = None
+        parsed = urlparse(final_url)
+        qs = parse_qs(parsed.query)
+        if 'xsec_token' in qs:
+            xsec_token = qs['xsec_token'][0]
+
+        return note_id, xsec_token, final_url
+
+    async def _parse_via_api(self, note_id: str, xsec_token: str) -> dict | None:
+        """通过 edith API 获取笔记详情（无水印），返回解析结果 dict 或 None"""
+        try:
+            if not self._api_client:
+                self._api_client = XhsApiClient()
+            await self._api_client.initialize()
+
+            res = await self._api_client.get_note_detail(note_id, xsec_token)
+            if not res or "data" not in res:
+                logger.warning(f"API 返回无数据: {res}")
+                return None
+
+            items = res.get("data", {}).get("items", [])
+            if not items:
+                logger.warning("API 返回空 items")
+                return None
+
+            note_card = items[0].get("note_card", {})
+            if not note_card:
+                return None
+
+            return self._build_result_from_api(note_card, note_id)
+
+        except Exception as e:
+            logger.warning(f"API 方式解析失败: {e}")
+            logger.debug(traceback.format_exc())
+            return None
+
+    def _build_result_from_api(self, note_card: dict, note_id: str) -> dict:
+        """从 API 返回的 note_card 构建标准结果"""
+        # 基础字段
+        user = note_card.get("user", {})
+        title = note_card.get("title", "小红书内容")
+        desc = note_card.get("desc", "")
+        note_type = note_card.get("type", "normal")  # "normal" or "video"
+
+        result = {
+            "title": title,
+            "author": {
+                "name": user.get("nickname", "未知作者"),
+                "id": user.get("user_id", ""),
+                "avatar": user.get("avatar", ""),
+            },
+            "content": desc,
+            "noteId": note_id,
+            "originalUrl": f"https://www.xiaohongshu.com/explore/{note_id}",
+            "images": [],
+            "videos": [],
+            "cover": None,
+            "contentType": "video" if note_type == "video" else "image",
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "source": "api",
+        }
+
+        # 图片提取（无水印）
+        image_list = note_card.get("image_list", [])
+        for img in image_list:
+            # info_list 包含多种格式，取第一个可用的
+            info_list = img.get("info_list", [])
+            url = img.get("url_default", "") or img.get("url", "")
+            if info_list:
+                # 优先选 jpg/webp 大图
+                for info in info_list:
+                    if info.get("url"):
+                        url = info["url"]
+                        break
+            if url:
+                if not url.startswith("http"):
+                    url = "https://sns-img-qc.xhscdn.com/" + url
+                result["images"].append(url)
+
+        # 视频提取
+        video_info = note_card.get("video", {})
+        if video_info:
+            # consumer 结构下有 origin_video_key
+            consumer = video_info.get("consumer", {})
+            origin_key = consumer.get("origin_video_key", "")
+            if origin_key:
+                result["videos"].append(f"https://sns-video-bd.xhscdn.com/{origin_key}")
+
+            # media 结构
+            media = video_info.get("media", {})
+            stream = media.get("stream", {})
+            for quality in ("h264", "h265", "av1"):
+                streams = stream.get(quality, [])
+                for s in streams:
+                    master_url = s.get("master_url", "")
+                    if master_url:
+                        result["videos"].append(master_url)
+                        break
+                if result["videos"]:
+                    break
+
+        if result["videos"]:
+            result["video"] = result["videos"][0]
+
+        # 封面
+        if result["contentType"] == "video" and result["images"]:
+            result["cover"] = result["images"][0]
+            result["images"] = []
+        elif result["images"]:
+            result["cover"] = result["images"][0]
+
+        # Live Photo 处理
+        if image_list:
+            live_videos = []
+            for img in image_list:
+                stream = img.get("stream", {})
+                for quality in ("h264", "h265"):
+                    vlist = stream.get(quality, [])
+                    if vlist and isinstance(vlist, list) and len(vlist) > 0:
+                        master = vlist[0].get("master_url", "")
+                        if master:
+                            live_videos.append(master)
+                        break
+            if live_videos and result["contentType"] != "video":
+                result["isLivePhoto"] = True
+                result["isGroupedContent"] = True
+                result["videos"] = live_videos
+                result["video"] = live_videos[0]
+
+        return result
+
     async def fetch_with_retry(self, url):
         """异步请求，带重试。
         使用移动端 UA 绕过小红书桌面端的 xsec Cookie 校验机制。
@@ -396,7 +583,20 @@ class AsyncXiaohongshuParser:
                     raise Exception(f"请求失败: {str(e)}")
 
     async def parse(self, url):
-        """解析小红书链接（主入口）"""
+        """解析小红书链接（主入口）
+
+        策略：使用移动端 HTML 解析 + CDN URL 重写去除水印。
+        API 方式因 JSVMP 签名机制更新暂不可用，保留代码待后续修复。
+        """
+        try:
+            return await self._parse_via_html(url)
+        except Exception as e:
+            logger.error(f"小红书解析异常: {e}")
+            logger.error(traceback.format_exc())
+            return {'error': True, 'message': str(e)}
+
+    async def _parse_via_html(self, url):
+        """通过移动端 HTML 解析（fallback，有水印）"""
         try:
             html, final_url = await self.fetch_with_retry(url)
 
@@ -418,7 +618,8 @@ class AsyncXiaohongshuParser:
                 'videos': self.extract_videos(html),
                 'cover': None,
                 'contentType': 'text',
-                'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+                'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
+                'source': 'html',
             }
 
             if result['videos']:
