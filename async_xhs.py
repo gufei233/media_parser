@@ -24,7 +24,10 @@ class AsyncXiaohongshuParser:
             'max_retries': 3,
             'retry_delay': 1
         }
-        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"
+        self.user_agent_desktop = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"
+        self.user_agent_mobile = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        # 默认使用 mobile UA（小红书对移动端分享链接不做 xsec Cookie 校验）
+        self.user_agent = self.user_agent_mobile
 
         # 正则表达式模式
         self.patterns = {
@@ -163,7 +166,7 @@ class AsyncXiaohongshuParser:
 
     def extract_images(self, html):
         images = []
-        # 尝试所有正则模式
+        # 方式1：从 og:image meta 标签提取（桌面端）
         for pattern in self.patterns['og_image']:
             for match in pattern.finditer(html):
                 url = self.clean_url(match.group(1))
@@ -171,6 +174,31 @@ class AsyncXiaohongshuParser:
                     images.append(url)
             if len(images) > 0:
                 break
+
+        # 方式2：从 img/data-src 提取高清直链（移动端页面）
+        # 优先使用 sns-na-i*.xhscdn.com 的无签名直链（不过期）
+        if not images:
+            direct_pattern = re.compile(
+                r'https://sns-(?:na|img)-i[0-9]+\.xhscdn\.com/'
+                r'[a-f0-9-]+\?imageView2[^"\'\s<>]*'
+            )
+            for match in direct_pattern.finditer(html):
+                url = match.group(0)
+                if url not in images and 'avatar' not in url:
+                    images.append(url)
+
+        # 方式3：从 img src / data-src 提取带签名的图片 URL（移动端页面备用）
+        if not images:
+            signed_pattern = re.compile(
+                r'(?:src|data-src)=["\']'
+                r'(https?://sns-webpic[^"\'\s<>]+/notes_pre_post/[^"\'\s<>]+)'
+                r'["\']'
+            )
+            for match in signed_pattern.finditer(html):
+                url = match.group(1)
+                if url not in images:
+                    images.append(url)
+
         return images
 
     def extract_videos(self, html):
@@ -330,22 +358,34 @@ class AsyncXiaohongshuParser:
 
     # ==================== 主流程 ====================
 
+    def _build_headers(self):
+        """构建模拟浏览器的请求头"""
+        return {
+            'User-Agent': self.user_agent,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Upgrade-Insecure-Requests': '1',
+        }
+
+    @staticmethod
+    def _is_404_response(final_url, html) -> bool:
+        """检测是否落入 404 页面"""
+        return '/404' in final_url or 'errorCode=' in final_url
+
     async def fetch_with_retry(self, url):
-        """异步请求，带重试"""
+        """异步请求，带重试。
+        使用移动端 UA 绕过小红书桌面端的 xsec Cookie 校验机制。
+        小红书对移动端分享链接（app_platform=ios）使用移动端 UA 时不做额外校验。
+        """
         if not self._is_valid_http_url(url):
             raise Exception(f"URL无效: {url}")
 
         session = await self._get_session()
+        headers = self._build_headers()
 
         for attempt in range(self.config['max_retries'] + 1):
             try:
-                headers = {
-                    'User-Agent': self.user_agent,
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                    'Cache-Control': 'no-cache'
-                }
-
                 async with session.get(url, headers=headers, allow_redirects=True) as resp:
                     if resp.status != 200:
                         raise Exception(f"HTTP {resp.status}")
@@ -354,10 +394,16 @@ class AsyncXiaohongshuParser:
                     raw = await resp.read()
                     html = self._decode_html_bytes(raw)
                     final_url = str(resp.url)
+
+                    # 检测是否被重定向到 404 页面
+                    if self._is_404_response(final_url, html):
+                        raise Exception("页面返回 404，笔记可能不存在或已被删除")
+
                     return html, final_url
 
             except Exception as e:
                 if attempt < self.config['max_retries']:
+                    logger.warning(f"小红书请求第 {attempt+1} 次失败: {e}，重试中...")
                     await asyncio.sleep(self.config['retry_delay'] * (attempt + 1))
                 else:
                     raise Exception(f"请求失败: {str(e)}")
