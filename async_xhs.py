@@ -166,7 +166,7 @@ class AsyncXiaohongshuParser:
 
     def extract_images(self, html):
         images = []
-        # 方式1：从 og:image meta 标签提取（桌面端）
+        # 方式1：从 og:image meta 标签提取（桌面端 SSR 页面）
         for pattern in self.patterns['og_image']:
             for match in pattern.finditer(html):
                 url = self.clean_url(match.group(1))
@@ -175,27 +175,14 @@ class AsyncXiaohongshuParser:
             if len(images) > 0:
                 break
 
-        # 方式2：从 img/data-src 提取高清直链（移动端页面）
-        # 优先使用 sns-na-i*.xhscdn.com 的无签名直链（不过期）
+        # 方式2：从移动端轮播图结构提取（onix-carousel-item 内的 <img>）
+        # 这些才是当前笔记的图片，而非页面底部推荐流的图片
         if not images:
-            direct_pattern = re.compile(
-                r'https://sns-(?:na|img)-i[0-9]+\.xhscdn\.com/'
-                r'[a-f0-9-]+\?imageView2[^"\'\s<>]*'
+            carousel_imgs = re.findall(
+                r'class="onix-carousel-item"[^>]*>.*?<img[^>]*src=["\']([^"\']+)["\']',
+                html, re.DOTALL
             )
-            for match in direct_pattern.finditer(html):
-                url = match.group(0)
-                if url not in images and 'avatar' not in url:
-                    images.append(url)
-
-        # 方式3：从 img src / data-src 提取带签名的图片 URL（移动端页面备用）
-        if not images:
-            signed_pattern = re.compile(
-                r'(?:src|data-src)=["\']'
-                r'(https?://sns-webpic[^"\'\s<>]+/notes_pre_post/[^"\'\s<>]+)'
-                r'["\']'
-            )
-            for match in signed_pattern.finditer(html):
-                url = match.group(1)
+            for url in carousel_imgs:
                 if url not in images:
                     images.append(url)
 
