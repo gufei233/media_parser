@@ -3,6 +3,7 @@
 # 核心依赖
 aiohttp>=3.13.0          # 异步 HTTP 客户端
 gmssl>=3.2.1             # ABogus 算法所需（SM算法）
+Pillow>=10.0.0           # 图片尺寸解析
 
 # AstrBot 框架（由框架提供，无需单独安装）
 # astrbot>=3.4.28

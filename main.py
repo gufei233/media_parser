@@ -11,6 +11,8 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+from io import BytesIO
+from PIL import Image
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
@@ -30,318 +32,13 @@ except ImportError:
     from utils import normalize_text
 
 
-DOUYIN_INFO_CARD_TEMPLATE = """
-<div style="
-  width: {{ card_width }}px;
-  height: {{ card_height }}px;
-  min-height: {{ card_height }}px;
-  font-family: HarmonyOSHans-Regular, bilifont, -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', 'Hiragino Sans GB', 'WenQuanYi Micro Hei', 'Segoe UI', 'Roboto', sans-serif;
-  color: #f3f6ff;
-  background: #0b1322;
-  overflow: hidden;
-  position: relative;
-  box-sizing: border-box;
-">
-  <style>
-    {% if font_regular_url %}
-    @font-face {
-      font-family: HarmonyOSHans-Regular;
-      src: url('{{ font_regular_url }}') format('truetype');
-      font-style: normal;
-      font-weight: 400;
-      font-display: swap;
-    }
-    {% endif %}
-    {% if font_medium_url %}
-    @font-face {
-      font-family: HarmonyOSHans-Regular;
-      src: url('{{ font_medium_url }}') format('truetype');
-      font-style: normal;
-      font-weight: 500;
-      font-display: swap;
-    }
-    {% endif %}
-    {% if font_bold_url %}
-    @font-face {
-      font-family: HarmonyOSHans-Regular;
-      src: url('{{ font_bold_url }}') format('truetype');
-      font-style: normal;
-      font-weight: 700;
-      font-display: swap;
-    }
-    {% endif %}
-    html, body {
-      width: {{ card_width }}px;
-      height: {{ card_height }}px;
-      margin: 0;
-      padding: 0;
-      overflow: hidden;
-      background: transparent;
-      font-family: HarmonyOSHans-Regular, bilifont, -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', 'Hiragino Sans GB', 'WenQuanYi Micro Hei', 'Segoe UI', 'Roboto', sans-serif;
-    }
-    * { box-sizing: border-box; }
-  </style>
-  {% if cover_url %}
-  <img src="{{ cover_url }}" alt="cover" style="
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    filter: saturate(112%) brightness(1.02);
-    transform: scale(1.02);
-  " />
-  <img src="{{ cover_url }}" alt="" style="
-    position: absolute;
-    inset: -24px;
-    width: calc(100% + 48px);
-    height: calc(100% + 48px);
-    object-fit: cover;
-    filter: blur(46px) saturate(112%);
-    transform: scale(1.18);
-    opacity: 0.1;
-  " />
-  {% endif %}
+def _load_template(name: str) -> str:
+    tmpl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", name)
+    with open(tmpl_path, "r", encoding="utf-8") as f:
+        return f.read()
 
-  <div style="
-    position: absolute;
-    left: 0;
-    right: 0;
-    top: 0;
-    height: 44%;
-    background: linear-gradient(
-      to bottom,
-      rgba(35, 39, 48, 0.34) 0%,
-      rgba(35, 39, 48, 0.16) 56%,
-      rgba(35, 39, 48, 0) 100%
-    );
-    z-index: 1;
-  "></div>
-  <div style="
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    height: 46%;
-    background: linear-gradient(
-      to top,
-      rgba(35, 39, 48, 0.4) 0%,
-      rgba(35, 39, 48, 0.18) 56%,
-      rgba(35, 39, 48, 0) 100%
-    );
-    z-index: 1;
-  "></div>
 
-  <div style="
-    position: relative;
-    z-index: 2;
-    width: calc(100% / {{ ui_scale }});
-    height: calc(100% / {{ ui_scale }});
-    transform: scale({{ ui_scale }});
-    transform-origin: top left;
-    padding: 28px 34px 30px 34px;
-    display: flex;
-    flex-direction: column;
-    justify-content: space-between;
-  ">
-    <div>
-      <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;">
-        <div style="display: flex; align-items: center; gap: 14px; min-width: 0; width: 50%; max-width: 50%;">
-          {% if author_avatar %}
-          <img src="{{ author_avatar }}" alt="avatar" style="width: {{ avatar_size }}px; height: {{ avatar_size }}px; border-radius: 50%; object-fit: cover; border: 2px solid rgba(255,255,255,0.26);" />
-          {% endif %}
-          <div style="min-width: 0;">
-            <div style="
-              font-size: {{ author_font_size }}px;
-              font-weight: 700;
-              line-height: 1.14;
-              overflow: hidden;
-              {% if author_allow_wrap %}
-              display: -webkit-box;
-              -webkit-line-clamp: 2;
-              -webkit-box-orient: vertical;
-              white-space: normal;
-              word-break: break-all;
-              {% else %}
-              white-space: nowrap;
-              text-overflow: ellipsis;
-              {% endif %}
-            ">{{ author_name_html | safe }}</div>
-          </div>
-        </div>
-        <div style="
-          width: 50%;
-          max-width: 50%;
-          min-width: 0;
-          display: flex;
-          justify-content: flex-end;
-          align-items: flex-start;
-          flex-shrink: 0;
-          gap: {{ stat_col_gap }}px;
-          text-align: center;
-          color: rgba(239, 245, 255, 0.92);
-          text-shadow: 0 1px 6px rgba(0, 0, 0, 0.3);
-        ">
-        <div style="width: {{ stat_item_width }}px; display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0;">
-          <svg xmlns="http://www.w3.org/2000/svg" width="{{ stat_icon_size }}" height="{{ stat_icon_size }}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="opacity: 0.66;">
-            <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"></path>
-          </svg>
-          <span style="display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; font-size: {{ stat_font_size }}px; font-weight: 500; white-space: nowrap; line-height: 1; font-variant-numeric: tabular-nums; font-feature-settings: 'tnum' 1; font-family: HarmonyOSHans-Regular, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;">{{ digg_count }}</span>
-        </div>
-        <div style="width: {{ stat_item_width }}px; display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0;">
-          <svg xmlns="http://www.w3.org/2000/svg" width="{{ stat_icon_size }}" height="{{ stat_icon_size }}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="opacity: 0.66;">
-            <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"></path>
-          </svg>
-          <span style="display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; font-size: {{ stat_font_size }}px; font-weight: 500; white-space: nowrap; line-height: 1; font-variant-numeric: tabular-nums; font-feature-settings: 'tnum' 1; font-family: HarmonyOSHans-Regular, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;">{{ comment_count }}</span>
-        </div>
-        <div style="width: {{ stat_item_width }}px; display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0;">
-          <svg xmlns="http://www.w3.org/2000/svg" width="{{ stat_icon_size }}" height="{{ stat_icon_size }}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="opacity: 0.66;">
-            <path d="M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a.53.53 0 0 0 .399.29l5.166.751a.53.53 0 0 1 .294.904l-3.738 3.644a.53.53 0 0 0-.152.468l.882 5.14a.53.53 0 0 1-.768.559l-4.62-2.43a.53.53 0 0 0-.494 0l-4.62 2.43a.53.53 0 0 1-.768-.559l.882-5.14a.53.53 0 0 0-.152-.468L2.76 8.919a.53.53 0 0 1 .294-.904l5.166-.751a.53.53 0 0 0 .399-.29z"></path>
-          </svg>
-          <span style="display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; font-size: {{ stat_font_size }}px; font-weight: 500; white-space: nowrap; line-height: 1; font-variant-numeric: tabular-nums; font-feature-settings: 'tnum' 1; font-family: HarmonyOSHans-Regular, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;">{{ collect_count }}</span>
-        </div>
-        <div style="width: {{ stat_item_width }}px; display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0;">
-          <svg xmlns="http://www.w3.org/2000/svg" width="{{ stat_icon_size }}" height="{{ stat_icon_size }}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="opacity: 0.66;">
-            <circle cx="18" cy="5" r="3"></circle>
-            <circle cx="6" cy="12" r="3"></circle>
-            <circle cx="18" cy="19" r="3"></circle>
-            <line x1="8.59" x2="15.42" y1="13.51" y2="17.49"></line>
-            <line x1="15.41" x2="8.59" y1="6.51" y2="10.49"></line>
-          </svg>
-          <span style="display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; font-size: {{ stat_font_size }}px; font-weight: 500; white-space: nowrap; line-height: 1; font-variant-numeric: tabular-nums; font-feature-settings: 'tnum' 1; font-family: HarmonyOSHans-Regular, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;">{{ share_count }}</span>
-        </div>
-      </div>
-      </div>
-
-      <div style="
-        margin-top: 10px;
-        font-size: {{ meta_font_size }}px;
-        line-height: 1.58;
-        color: rgba(242, 247, 255, 0.95);
-        word-break: break-word;
-        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
-      ">
-        <div>{{ create_time_html | safe }}</div>
-      </div>
-    </div>
-
-    <div style="
-      align-self: stretch;
-      width: calc(100% / {{ bottom_scale }});
-      transform: scale({{ bottom_scale }});
-      transform-origin: left bottom;
-      display: flex;
-      flex-direction: column;
-      align-items: stretch;
-      gap: 10px;
-    ">
-      <div style="
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-end;
-        gap: 12px;
-      ">
-      <div style="
-        width: 50%;
-        max-width: 50%;
-        min-width: 0;
-        display: inline-flex;
-        align-items: center;
-        justify-content: flex-start;
-        gap: 8px;
-        flex-wrap: wrap;
-        overflow: hidden;
-      ">
-        <div style="padding: 9px 16px; border-radius: 999px; font-size: 24px; background: rgba(255,255,255,0.19); white-space: nowrap;">
-          {{ media_type_html | safe }}
-        </div>
-        {% if duration %}
-        <div style="padding: 9px 16px; border-radius: 999px; font-size: 24px; background: rgba(255,255,255,0.19); white-space: nowrap;">
-          {{ duration_html | safe }}
-        </div>
-        {% endif %}
-      </div>
-
-      <div style="
-        width: 50%;
-        max-width: 50%;
-        min-width: 0;
-        display: flex;
-        justify-content: flex-end;
-      ">
-      {% if music_title and music_cover %}
-      <div style="
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 6px 10px 6px 6px;
-        border-radius: 16px;
-        background: rgba(255, 255, 255, 0.2);
-        backdrop-filter: blur(14px);
-        border: 1px solid rgba(255,255,255,0.3);
-        box-shadow: 0 8px 18px rgba(3, 8, 18, 0.22);
-        overflow: hidden;
-        max-width: 100%;
-      ">
-        <div style="position: relative; width: 44px; height: 44px; flex-shrink: 0;">
-          <img src="{{ music_cover }}" alt="" style="
-            position: absolute;
-            inset: 0;
-            width: 100%;
-            height: 100%;
-            border-radius: 10px;
-            object-fit: cover;
-            filter: blur(4px);
-            transform: scale(1.08);
-          " />
-          <img src="{{ music_cover }}" alt="" style="
-            position: relative;
-            width: 100%;
-            height: 100%;
-            border-radius: 10px;
-            object-fit: cover;
-            z-index: 1;
-          " />
-        </div>
-        <div style="display: flex; flex-direction: column; gap: 2px; min-width: 0;">
-          <div style="
-            font-size: 20px;
-            font-weight: 600;
-            color: rgba(248, 251, 255, 0.96);
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-          ">{{ music_title_html | safe }}</div>
-          <div style="
-            font-size: 16px;
-            color: rgba(233, 241, 255, 0.76);
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-          ">{{ music_author_html | safe }}</div>
-        </div>
-      </div>
-      {% endif %}
-      </div>
-      </div>
-
-      <div style="
-        align-self: stretch;
-        backdrop-filter: blur(20px);
-        background: rgba(18, 33, 60, 0.16);
-        border: 1px solid rgba(255,255,255,0.26);
-        border-radius: 24px;
-        padding: 20px 22px 22px 22px;
-        box-shadow: 0 12px 24px rgba(3, 8, 18, 0.24);
-      ">
-        <div style="font-size: {{ desc_font_size }}px; line-height: 1.32; font-weight: 700; word-break: break-word; text-shadow: 0 2px 8px rgba(0,0,0,0.28);">
-          {{ desc_html | safe }}
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-"""
+DOUYIN_INFO_CARD_TEMPLATE = _load_template("douyin_info_card.html")
 
 
 @register("media_parser", "Author", "抖音小红书链接解析插件（异步优化版）", "2.3.0")
@@ -482,8 +179,6 @@ class MediaParserPlugin(Star):
             if render_mode in {"image", "both"}:
                 info_image_url = await self._render_douyin_info_image(
                     result=result,
-                    image_count=len(images),
-                    video_count=len(video_links),
                     dy_downloader=dy_downloader,
                     media_bytes_cache=media_bytes_cache,
                 )
@@ -659,8 +354,6 @@ class MediaParserPlugin(Star):
     async def _render_douyin_info_image(
         self,
         result: Dict[str, Any],
-        image_count: int,
-        video_count: int,
         dy_downloader: AsyncDouyinDownloader,
         media_bytes_cache: Optional[Dict[str, bytes]] = None,
     ) -> Optional[str]:
@@ -673,20 +366,12 @@ class MediaParserPlugin(Star):
                 desc = desc[:77] + "..."
 
             cover_source_url = self._pick_cover_url(result.get("downloads", []))
-            cover_url = await self._to_data_url_if_possible(
-                dy_downloader,
-                cover_source_url,
-                media_bytes_cache,
-            )
-            author_avatar = await self._to_data_url_if_possible(
-                dy_downloader,
-                self._normalize_text(author.get("avatar"), ""),
-                media_bytes_cache,
-            )
-            music_cover = await self._to_data_url_if_possible(
-                dy_downloader,
-                self._normalize_text(music.get("cover"), ""),
-                media_bytes_cache,
+            avatar_source = self._normalize_text(author.get("avatar"), "")
+            music_cover_source = self._normalize_text(music.get("cover"), "")
+            cover_url, author_avatar, music_cover = await asyncio.gather(
+                self._to_data_url_if_possible(dy_downloader, cover_source_url, media_bytes_cache),
+                self._to_data_url_if_possible(dy_downloader, avatar_source, media_bytes_cache),
+                self._to_data_url_if_possible(dy_downloader, music_cover_source, media_bytes_cache),
             )
             cover_raw = (
                 media_bytes_cache.get(cover_source_url, b"")
@@ -694,8 +379,6 @@ class MediaParserPlugin(Star):
                 else b""
             )
             cover_size = self._get_image_size(cover_raw)
-            if not cover_size:
-                cover_size = self._get_image_size_from_data_url(cover_url)
             card_width, card_height, ui_scale = self._compute_render_size(cover_size)
             overlay_metrics = self._compute_overlay_metrics(card_width, card_height)
             author_name = self._normalize_text(author.get("nickname"), "未知作者")
@@ -706,20 +389,14 @@ class MediaParserPlugin(Star):
             music_author = self._normalize_text(music.get("author"), "")
 
             render_data = {
-                "work_id": self._normalize_text(result.get("id"), "-"),
-                "desc": desc,
-                "media_type": media_type,
-                "author_name": author_name,
                 "author_avatar": author_avatar,
                 "cover_url": cover_url,
                 "digg_count": self._format_count(stats.get("digg_count", 0)),
                 "comment_count": self._format_count(stats.get("comment_count", 0)),
                 "collect_count": self._format_count(stats.get("collect_count", 0)),
                 "share_count": self._format_count(stats.get("share_count", 0)),
-                "create_time": create_time,
                 "duration": duration,
                 "music_title": music_title,
-                "music_author": music_author,
                 "music_cover": music_cover,
                 "author_name_html": self._to_html_entities(author_name),
                 "desc_html": self._to_html_entities(desc),
@@ -728,8 +405,6 @@ class MediaParserPlugin(Star):
                 "duration_html": self._to_html_entities(duration),
                 "music_title_html": self._to_html_entities(music_title),
                 "music_author_html": self._to_html_entities(music_author),
-                "image_count": image_count,
-                "video_count": video_count,
                 "card_width": card_width,
                 "card_height": card_height,
                 "ui_scale": ui_scale,
@@ -811,104 +486,11 @@ class MediaParserPlugin(Star):
     def _get_image_size(raw: bytes) -> Optional[Tuple[int, int]]:
         if not raw or len(raw) < 10:
             return None
-
-        # PNG
-        if raw.startswith(b"\x89PNG\r\n\x1a\n") and len(raw) >= 24:
-            width = int.from_bytes(raw[16:20], "big")
-            height = int.from_bytes(raw[20:24], "big")
-            if width > 0 and height > 0:
-                return width, height
-
-        # GIF
-        if raw.startswith((b"GIF87a", b"GIF89a")) and len(raw) >= 10:
-            width = int.from_bytes(raw[6:8], "little")
-            height = int.from_bytes(raw[8:10], "little")
-            if width > 0 and height > 0:
-                return width, height
-
-        # JPEG
-        if raw.startswith(b"\xff\xd8"):
-            idx = 2
-            raw_len = len(raw)
-            sof_markers = {
-                0xC0,
-                0xC1,
-                0xC2,
-                0xC3,
-                0xC5,
-                0xC6,
-                0xC7,
-                0xC9,
-                0xCA,
-                0xCB,
-                0xCD,
-                0xCE,
-                0xCF,
-            }
-            while idx + 8 < raw_len:
-                if raw[idx] != 0xFF:
-                    idx += 1
-                    continue
-                marker = raw[idx + 1]
-                idx += 2
-                if marker in (0xD8, 0xD9):
-                    continue
-                if idx + 2 > raw_len:
-                    break
-                seg_len = int.from_bytes(raw[idx : idx + 2], "big")
-                if seg_len < 2 or idx + seg_len > raw_len:
-                    break
-                if marker in sof_markers and idx + 7 < raw_len:
-                    height = int.from_bytes(raw[idx + 3 : idx + 5], "big")
-                    width = int.from_bytes(raw[idx + 5 : idx + 7], "big")
-                    if width > 0 and height > 0:
-                        return width, height
-                idx += seg_len
-
-        # WEBP
-        if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
-            chunk = raw[12:16]
-            if chunk == b"VP8X" and len(raw) >= 30:
-                width = int.from_bytes(raw[24:27], "little") + 1
-                height = int.from_bytes(raw[27:30], "little") + 1
-                if width > 0 and height > 0:
-                    return width, height
-            if chunk == b"VP8L" and len(raw) >= 25:
-                b0 = raw[21]
-                b1 = raw[22]
-                b2 = raw[23]
-                b3 = raw[24]
-                width = ((b1 & 0x3F) << 8 | b0) + 1
-                height = ((b3 & 0x0F) << 10 | b2 << 2 | (b1 >> 6)) + 1
-                if width > 0 and height > 0:
-                    return width, height
-            if chunk == b"VP8 " and len(raw) >= 30:
-                # Lossy WebP (VP8): parse frame header width/height.
-                # Layout: 3-byte frame tag + 0x9d012a start code + 2-byte w + 2-byte h.
-                if raw[23:26] == b"\x9d\x01\x2a":
-                    width = int.from_bytes(raw[26:28], "little") & 0x3FFF
-                    height = int.from_bytes(raw[28:30], "little") & 0x3FFF
-                    if width > 0 and height > 0:
-                        return width, height
-
-        return None
-
-    @staticmethod
-    def _get_image_size_from_data_url(data_url: str) -> Optional[Tuple[int, int]]:
-        if not data_url or not data_url.startswith("data:image"):
-            return None
-        comma_idx = data_url.find(",")
-        if comma_idx <= 0:
-            return None
-        meta = data_url[:comma_idx].lower()
-        payload = data_url[comma_idx + 1 :]
-        if ";base64" not in meta:
-            return None
         try:
-            raw = base64.b64decode(payload)
+            with Image.open(BytesIO(raw)) as img:
+                return img.size if img.size[0] > 0 and img.size[1] > 0 else None
         except Exception:
             return None
-        return MediaParserPlugin._get_image_size(raw)
 
     @staticmethod
     def _compute_render_size(
@@ -988,9 +570,7 @@ class MediaParserPlugin(Star):
         if aspect >= 1.5:
             bottom_scale = 1.65
         elif aspect >= 1.15:
-            bottom_scale = 1
-        elif aspect >= 0.9:
-            bottom_scale = 0.95
+            bottom_scale = 1.0
         else:
             bottom_scale = 0.95
 
