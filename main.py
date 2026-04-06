@@ -406,7 +406,7 @@ class MediaParserPlugin(Star):
             await self.dy_downloader.close()
         logger.info("资源清理完成")
 
-    @filter.on_message()
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def parse_media_link(self, event: AstrMessageEvent):
         """媒体链接解析入口"""
         # Session whitelist check
