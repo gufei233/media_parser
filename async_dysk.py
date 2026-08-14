@@ -351,8 +351,9 @@ class AsyncDouyinDownloader:
             logger.warning(f"短链 HEAD 请求失败，回退 GET: {e}")
 
         # Some endpoints treat HEAD differently. GET is a compatibility fallback;
-        # network failures use one initial attempt plus configured extra retries.
+        # transient failures use one initial attempt plus configured extra retries.
         for attempt in range(self._attempt_limit):
+            failure = None
             try:
                 async with session.get(
                     url,
@@ -366,15 +367,23 @@ class AsyncDouyinDownloader:
                     if aweme_id:
                         self._log_cookie_names()
                         return aweme_id
-                    logger.error("链接解析失败: 重定向链中未找到作品ID")
-                    return None
+                    if resp.status in {408, 425, 429} or resp.status >= 500:
+                        failure = f"HTTP {resp.status}"
+                    else:
+                        logger.error("链接解析失败: 重定向链中未找到作品ID")
+                        return None
             except Exception as e:
-                if attempt + 1 >= self._attempt_limit:
-                    logger.error(
-                        f"链接解析失败(GET尝试{self._attempt_limit}次): {e}"
-                    )
-                    return None
-                await asyncio.sleep(1)
+                failure = f"{type(e).__name__}: {e}"
+
+            if attempt + 1 >= self._attempt_limit:
+                logger.error(
+                    f"链接解析失败(GET尝试{self._attempt_limit}次): {failure}"
+                )
+                return None
+            logger.warning(
+                f"短链 GET 请求失败({failure})，准备第{attempt + 2}次尝试"
+            )
+            await asyncio.sleep(1)
 
         return None
 
@@ -507,14 +516,24 @@ class AsyncDouyinDownloader:
             "Accept": "*/*",
             "Referer": "https://www.douyin.com/?recommend=1",
         }
-        try:
-            timeout = aiohttp.ClientTimeout(total=self.common_timeout)
-            async with session.get(url, headers=headers, timeout=timeout) as resp:
-                if resp.status in (200, 206):
-                    return await resp.read()
-                logger.debug(f"[download_to_bytes] HTTP {resp.status} for {url}")
-        except Exception as e:
-            logger.debug(f"[download_to_bytes] failed: {e}")
+        for attempt in range(self._attempt_limit):
+            failure = None
+            try:
+                timeout = aiohttp.ClientTimeout(total=self.common_timeout)
+                async with session.get(url, headers=headers, timeout=timeout) as resp:
+                    if resp.status in (200, 206):
+                        return await resp.read()
+                    failure = f"HTTP {resp.status}"
+                    if resp.status not in {408, 425, 429} and resp.status < 500:
+                        logger.debug(f"[download_to_bytes] {failure} for {url}")
+                        return None
+            except Exception as e:
+                failure = f"{type(e).__name__}: {e}"
+
+            if attempt + 1 >= self._attempt_limit:
+                logger.debug(f"[download_to_bytes] failed after {self._attempt_limit} attempts: {failure}")
+                return None
+            await asyncio.sleep(1)
         return None
 
     async def download_video(
@@ -550,18 +569,17 @@ class AsyncDouyinDownloader:
         # ========== 第一步：尝试直连下载（支持断点续传）==========
         total_size = 0  # 已下载的总字节数
         expected_size = None  # 文件总大小（从首次请求获取）
-        max_stall = self._attempt_limit  # 首次请求 + 连续无进展重试
-        stall_count = 0  # 连续无进展计数
+        max_attempts = self._attempt_limit  # 首次请求 + 额外重试
         attempt = 0
 
         logger.info(f"[下载] 开始: {save_path}")
 
-        while stall_count < max_stall:
+        while attempt < max_attempts:
             attempt += 1
             prev_size = total_size
             try:
                 if attempt > 1:
-                    await asyncio.sleep(min(2 * stall_count + 1, 10))
+                    await asyncio.sleep(min(2 * (attempt - 1) + 1, 10))
 
                 req_headers = dict(headers)
                 file_mode = 'wb'
@@ -570,7 +588,7 @@ class AsyncDouyinDownloader:
                 if total_size > 0 and os.path.exists(save_path):
                     req_headers["Range"] = f"bytes={total_size}-"
                     file_mode = 'ab'  # 追加模式
-                    logger.info(f"[下载] 续传从 {total_size} bytes 开始 (第{attempt}次请求, 停滞{stall_count}/{max_stall})")
+                    logger.info(f"[下载] 续传从 {total_size} bytes 开始 (第{attempt}/{max_attempts}次请求)")
                 elif attempt > 1:
                     logger.info(f"[下载] 重试 (第{attempt}次请求)")
 
@@ -591,8 +609,6 @@ class AsyncDouyinDownloader:
                         logger.error(f"[下载] 失败: HTTP {status}")
                         if status == 403:
                             total_size = 0
-                        # 不算有进展
-                        stall_count += 1
                         continue
 
                     # 获取文件总大小
@@ -667,11 +683,11 @@ class AsyncDouyinDownloader:
                 logger.error(f"[下载] 异常 (第{attempt}次请求): {e}")
                 total_size = 0
 
-            # 更新停滞计数：有进展则重置，否则+1
+            # 失败请求消耗一次尝试；下一轮使用 Range 续传已下载部分。
             if total_size > prev_size:
-                stall_count = 0
-            else:
-                stall_count += 1
+                logger.debug(
+                    f"[下载] 本次请求取得 {total_size - prev_size} bytes，准备续传"
+                )
 
         # 直连全部失败，检查是否有部分下载的数据可用
         if total_size > 0 and expected_size:

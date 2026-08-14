@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import unittest
+from unittest.mock import patch
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -20,6 +21,24 @@ class DebouncerTests(unittest.TestCase):
         debouncer.release_link("session", "https://example.invalid/a")
 
         self.assertFalse(debouncer.hit_link("session", "https://example.invalid/a"))
+
+    def test_old_failure_cannot_release_new_reservation(self):
+        debouncer = Debouncer(1)
+        link = "https://example.invalid/a"
+        with patch.object(debounce_module.time, "time", return_value=100.0):
+            hit, old_reservation = debouncer.reserve_link("session", link)
+        self.assertFalse(hit)
+
+        with patch.object(debounce_module.time, "time", return_value=102.0):
+            hit, new_reservation = debouncer.reserve_link("session", link)
+        self.assertFalse(hit)
+        self.assertNotEqual(old_reservation, new_reservation)
+
+        debouncer.release_link("session", link, old_reservation)
+
+        self.assertEqual(
+            debouncer.link_cache["session"][link], new_reservation
+        )
 
     def test_release_link_is_scoped_and_idempotent(self):
         debouncer = Debouncer(300)

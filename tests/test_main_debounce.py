@@ -133,27 +133,35 @@ class MainDebounceTests(unittest.IsolatedAsyncioTestCase):
         plugin._sync_downloader_config = lambda: None
         return plugin
 
-    async def consume_parse(self, plugin):
+    async def consume_parse(self, plugin, reservation=None):
         event = FakeEvent()
         return [
             result
-            async for result in plugin.parse_douyin(event, self.URL)
+            async for result in plugin.parse_douyin(
+                event, self.URL, debounce_reservation=reservation
+            )
         ]
 
     async def test_failed_detail_releases_link_reservation(self):
         plugin = self.make_plugin(None)
-        self.assertFalse(plugin.debouncer.hit_link("session", self.URL))
+        is_duplicate, reservation = plugin.debouncer.reserve_link(
+            "session", self.URL
+        )
+        self.assertFalse(is_duplicate)
 
-        results = await self.consume_parse(plugin)
+        results = await self.consume_parse(plugin, reservation)
 
         self.assertEqual(len(results), 1)
         self.assertFalse(plugin.debouncer.hit_link("session", self.URL))
 
     async def test_successful_detail_keeps_link_reservation(self):
         plugin = self.make_plugin({"downloads": []})
-        self.assertFalse(plugin.debouncer.hit_link("session", self.URL))
+        is_duplicate, reservation = plugin.debouncer.reserve_link(
+            "session", self.URL
+        )
+        self.assertFalse(is_duplicate)
 
-        results = await self.consume_parse(plugin)
+        results = await self.consume_parse(plugin, reservation)
 
         self.assertEqual(results, [])
         self.assertTrue(plugin.debouncer.hit_link("session", self.URL))

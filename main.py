@@ -133,7 +133,8 @@ class MediaParserPlugin(Star):
             return
         # Debounce check
         check_url = dy_url or xhs_url
-        if self.debouncer.hit_link(umo, check_url):
+        is_duplicate, reservation = self.debouncer.reserve_link(umo, check_url)
+        if is_duplicate:
             logger.warning(
                 f"[debounce] Skip parsing duplicated link within interval: {check_url}"
             )
@@ -141,7 +142,9 @@ class MediaParserPlugin(Star):
 
         # ========== 瑙ｆ瀽澶勭悊 ==========
         if dy_url:
-            async for result in self.parse_douyin(event, dy_url):
+            async for result in self.parse_douyin(
+                event, dy_url, debounce_reservation=reservation
+            ):
                 yield result
             event.stop_event()
         elif xhs_url:
@@ -151,7 +154,12 @@ class MediaParserPlugin(Star):
 
     # ==================== 鎶栭煶瑙ｆ瀽锛堝畬鍏ㄥ紓姝ワ級====================
 
-    async def parse_douyin(self, event: AstrMessageEvent, url: str):
+    async def parse_douyin(
+        self,
+        event: AstrMessageEvent,
+        url: str,
+        debounce_reservation: Optional[float] = None,
+    ):
         """Parse Douyin link asynchronously."""
         result = None
         session_id = event.unified_msg_origin
@@ -165,7 +173,9 @@ class MediaParserPlugin(Star):
             result = await dy_downloader.get_detail(url)
 
             if not result:
-                self.debouncer.release_link(session_id, url)
+                self.debouncer.release_link(
+                    session_id, url, debounce_reservation
+                )
                 logger.error("Douyin parse returned None; debounce reservation released")
                 yield event.plain_result(f"Parse failed. Open link directly:\n{url}")
                 return
@@ -226,7 +236,9 @@ class MediaParserPlugin(Star):
 
         except Exception as e:
             if not result:
-                self.debouncer.release_link(session_id, url)
+                self.debouncer.release_link(
+                    session_id, url, debounce_reservation
+                )
             error_msg = f"Douyin parse failed: {e}\n{traceback.format_exc()}"
             logger.error(error_msg)
             if self.cfg.show_download_fail_tip:

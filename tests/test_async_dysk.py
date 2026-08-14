@@ -2,11 +2,12 @@ import base64
 import importlib.util
 import json
 import logging
+import os
 import pathlib
 import sys
 import types
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -85,6 +86,25 @@ class FakeResponse:
 
     async def read(self):
         return self._body
+
+
+class FakeContent:
+    def __init__(self, chunks):
+        self._chunks = tuple(chunks)
+
+    async def iter_chunked(self, _size):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class FakeDownloadResponse(FakeResponse):
+    def __init__(self, *, body_chunks, content_range):
+        super().__init__(
+            status=206,
+            headers={"Content-Range": content_range},
+        )
+        self.content_length = sum(len(chunk) for chunk in body_chunks)
+        self.content = FakeContent(body_chunks)
 
 
 class FakeSession:
@@ -171,6 +191,39 @@ class DouyinUrlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, AWEME_ID)
         self.assertEqual(len(session.head_calls), 1)
+        self.assertEqual(len(session.get_calls), 1)
+
+    async def test_transient_get_status_uses_configured_retry(self):
+        session = FakeSession(
+            heads=(FakeResponse(status=405),),
+            gets=(
+                FakeResponse(status=503),
+                FakeResponse(status=200, url=VIDEO_URL),
+            ),
+        )
+        downloader = self.make_downloader(retries=1)
+        downloader._get_session = AsyncMock(return_value=session)
+
+        with patch.object(async_dysk.asyncio, "sleep", AsyncMock()):
+            result = await downloader._resolve_short_url(SHORT_URL)
+
+        self.assertEqual(result, AWEME_ID)
+        self.assertEqual(len(session.get_calls), 2)
+
+    async def test_non_transient_get_status_does_not_retry(self):
+        session = FakeSession(
+            heads=(FakeResponse(status=405),),
+            gets=(
+                FakeResponse(status=404),
+                FakeResponse(status=200, url=VIDEO_URL),
+            ),
+        )
+        downloader = self.make_downloader(retries=1)
+        downloader._get_session = AsyncMock(return_value=session)
+
+        result = await downloader._resolve_short_url(SHORT_URL)
+
+        self.assertIsNone(result)
         self.assertEqual(len(session.get_calls), 1)
 
     async def test_zero_retries_still_makes_one_get_attempt(self):
@@ -298,6 +351,48 @@ class DouyinDetailResponseTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DouyinDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_download_to_bytes_retries_transient_status(self):
+        session = FakeSession(
+            gets=(
+                FakeResponse(status=503),
+                FakeResponse(status=200, body=b"image"),
+            )
+        )
+        downloader = AsyncDouyinDownloader(download_retry_times=1)
+        downloader._get_session = AsyncMock(return_value=session)
+
+        with patch.object(async_dysk.asyncio, "sleep", AsyncMock()):
+            result = await downloader.download_to_bytes(
+                "https://example.invalid/cover.jpg"
+            )
+
+        self.assertEqual(result, b"image")
+        self.assertEqual(len(session.get_calls), 2)
+
+    async def test_partial_download_respects_attempt_limit(self):
+        session = FakeSession(
+            gets=(
+                FakeDownloadResponse(
+                    body_chunks=(b"partial",),
+                    content_range="bytes 0-6/100",
+                ),
+            )
+        )
+        downloader = AsyncDouyinDownloader(download_retry_times=0)
+        downloader._get_session = AsyncMock(return_value=session)
+        output_path = str(ROOT / "unused-partial-output.mp4")
+
+        try:
+            result = await downloader.download_video(
+                "https://example.invalid/video.mp4", output_path
+            )
+        finally:
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+
+        self.assertFalse(result)
+        self.assertEqual(len(session.get_calls), 1)
+
     async def test_zero_retries_still_starts_download_once(self):
         response = FakeResponse(status=503)
         session = FakeSession(gets=(response,))

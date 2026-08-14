@@ -2,7 +2,7 @@
 import time
 import random
 from collections import defaultdict
-from typing import Dict, Union, Callable
+from typing import Dict, Union, Callable, Optional, Tuple
 
 
 class Debouncer:
@@ -27,18 +27,10 @@ class Debouncer:
             return self._interval()
         return self._interval
 
-    def hit_link(self, session_id: str, link: str) -> bool:
-        """检查链接是否在防抖时间内
-
-        Args:
-            session_id: 会话ID
-            link: 链接
-
-        Returns:
-            bool: True表示命中防抖（应跳过），False表示未命中（可以解析）
-        """
+    def reserve_link(self, session_id: str, link: str) -> Tuple[bool, Optional[float]]:
+        """Reserve a link and return whether it was already active plus its token."""
         if self.interval == 0:
-            return False
+            return False, None
 
         # 10% 概率自动清理过期缓存，避免内存持续增长
         if random.random() < 0.1:
@@ -46,19 +38,25 @@ class Debouncer:
 
         now = time.time()
         last_time = self.link_cache[session_id].get(link, 0)
-
-        # 如果在防抖时间内
         if now - last_time < self.interval:
-            return True
+            return True, None
 
-        # 记录本次解析时间
         self.link_cache[session_id][link] = now
-        return False
+        return False, now
 
-    def release_link(self, session_id: str, link: str):
-        """Remove one link reservation so a failed parse can be retried."""
+    def hit_link(self, session_id: str, link: str) -> bool:
+        """检查链接是否在防抖时间内并为本次解析预留链接。"""
+        hit, _ = self.reserve_link(session_id, link)
+        return hit
+
+    def release_link(
+        self, session_id: str, link: str, reservation: Optional[float] = None
+    ):
+        """Remove the matching reservation so a failed parse can be retried."""
         session_cache = self.link_cache.get(session_id)
         if not session_cache:
+            return
+        if reservation is not None and session_cache.get(link) != reservation:
             return
         session_cache.pop(link, None)
         if not session_cache:
