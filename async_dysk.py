@@ -214,19 +214,22 @@ class AsyncDouyinDownloader:
         return match.group(1) if match else None
 
     @classmethod
-    def _extract_aweme_id_from_response(cls, original_url: str, response) -> Optional[str]:
-        """Inspect the complete redirect chain instead of only the final URL."""
-        candidates = [original_url]
+    def _extract_aweme_id_from_response(cls, response) -> Optional[str]:
+        """Inspect successful redirect hops and the final response URL."""
+        candidates = []
         for item in getattr(response, "history", ()) or ():
+            if getattr(item, "status", 0) >= 400:
+                continue
             history_url = str(getattr(item, "url", "") or "")
             if history_url:
                 candidates.append(history_url)
             location = getattr(item, "headers", {}).get("Location")
             if location:
-                candidates.append(urljoin(history_url or original_url, location))
-        final_url = str(getattr(response, "url", "") or "")
-        if final_url:
-            candidates.append(final_url)
+                candidates.append(urljoin(history_url, location))
+        if getattr(response, "status", 0) < 500:
+            final_url = str(getattr(response, "url", "") or "")
+            if final_url:
+                candidates.append(final_url)
 
         for candidate in candidates:
             aweme_id = cls._extract_aweme_id(candidate)
@@ -331,7 +334,7 @@ class AsyncDouyinDownloader:
                 logger.debug(
                     f"短链 HEAD 响应: HTTP {resp.status}, 最终URL: {resp.url}"
                 )
-                aweme_id = self._extract_aweme_id_from_response(url, resp)
+                aweme_id = self._extract_aweme_id_from_response(resp)
                 if aweme_id:
                     self._log_cookie_names()
                     return aweme_id
@@ -352,7 +355,7 @@ class AsyncDouyinDownloader:
                     logger.debug(
                         f"短链 GET 响应: HTTP {resp.status}, 最终URL: {resp.url}"
                     )
-                    aweme_id = self._extract_aweme_id_from_response(url, resp)
+                    aweme_id = self._extract_aweme_id_from_response(resp)
                     if aweme_id:
                         self._log_cookie_names()
                         return aweme_id

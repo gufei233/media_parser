@@ -142,6 +142,23 @@ class DouyinUrlTests(unittest.IsolatedAsyncioTestCase):
         url = AsyncDouyinDownloader._extract_http_url(self.SHARE_TEXT)
         self.assertEqual(url, SHORT_URL)
 
+    async def test_full_url_transient_failure_retries_before_using_id(self):
+        session = FakeSession(
+            heads=(FakeResponse(status=503, url=VIDEO_URL),),
+            gets=(
+                FakeResponse(status=503, url=VIDEO_URL),
+                FakeResponse(status=200, url=VIDEO_URL),
+            ),
+        )
+        downloader = self.make_downloader(retries=1)
+        downloader._get_session = AsyncMock(return_value=session)
+
+        with patch.object(async_dysk.asyncio, "sleep", AsyncMock()):
+            result = await downloader._resolve_short_url(VIDEO_URL)
+
+        self.assertEqual(result, AWEME_ID)
+        self.assertEqual(len(session.get_calls), 2)
+
     async def test_head_404_redirect_history_still_yields_id(self):
         history = FakeResponse(
             status=302,
