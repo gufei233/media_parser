@@ -214,7 +214,9 @@ class AsyncDouyinDownloader:
         return match.group(1) if match else None
 
     @classmethod
-    def _extract_aweme_id_from_response(cls, response) -> Optional[str]:
+    def _extract_aweme_id_from_response(
+        cls, response, allow_not_found: bool = False
+    ) -> Optional[str]:
         """Inspect successful redirect hops and the final response URL."""
         candidates = []
         for item in getattr(response, "history", ()) or ():
@@ -226,7 +228,8 @@ class AsyncDouyinDownloader:
             location = getattr(item, "headers", {}).get("Location")
             if location:
                 candidates.append(urljoin(history_url, location))
-        if getattr(response, "status", 0) < 500:
+        status = getattr(response, "status", 0)
+        if status < 400 or (allow_not_found and status == 404):
             final_url = str(getattr(response, "url", "") or "")
             if final_url:
                 candidates.append(final_url)
@@ -334,7 +337,9 @@ class AsyncDouyinDownloader:
                 logger.debug(
                     f"短链 HEAD 响应: HTTP {resp.status}, 最终URL: {resp.url}"
                 )
-                aweme_id = self._extract_aweme_id_from_response(resp)
+                aweme_id = self._extract_aweme_id_from_response(
+                    resp, allow_not_found=True
+                )
                 if aweme_id:
                     self._log_cookie_names()
                     return aweme_id
