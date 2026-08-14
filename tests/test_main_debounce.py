@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import logging
 import pathlib
@@ -152,6 +153,32 @@ class MainDebounceTests(unittest.IsolatedAsyncioTestCase):
         results = await self.consume_parse(plugin, reservation)
 
         self.assertEqual(len(results), 1)
+        self.assertFalse(plugin.debouncer.hit_link("session", self.URL))
+
+    async def test_cancelled_detail_releases_link_reservation(self):
+        plugin = self.make_plugin(None)
+        started = asyncio.Event()
+
+        async def blocked_detail(_url):
+            started.set()
+            await asyncio.Event().wait()
+
+        plugin.dy_downloader.get_detail = blocked_detail
+        is_duplicate, reservation = plugin.debouncer.reserve_link(
+            "session", self.URL
+        )
+        self.assertFalse(is_duplicate)
+        generator = plugin.parse_douyin(
+            FakeEvent(), self.URL, debounce_reservation=reservation
+        )
+        task = asyncio.create_task(anext(generator))
+        await started.wait()
+
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await generator.aclose()
+
         self.assertFalse(plugin.debouncer.hit_link("session", self.URL))
 
     async def test_successful_detail_keeps_link_reservation(self):

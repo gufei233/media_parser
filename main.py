@@ -162,6 +162,7 @@ class MediaParserPlugin(Star):
     ):
         """Parse Douyin link asynchronously."""
         result = None
+        reservation_committed = False
         session_id = event.unified_msg_origin
         try:
             logger.info(f"Start parsing Douyin link: {url}")
@@ -173,13 +174,11 @@ class MediaParserPlugin(Star):
             result = await dy_downloader.get_detail(url)
 
             if not result:
-                self.debouncer.release_link(
-                    session_id, url, debounce_reservation
-                )
                 logger.error("Douyin parse returned None; debounce reservation released")
                 yield event.plain_result(f"Parse failed. Open link directly:\n{url}")
                 return
 
+            reservation_committed = True
             uin = event.get_sender_id()
             name = event.get_sender_name()
 
@@ -235,14 +234,15 @@ class MediaParserPlugin(Star):
                 logger.warning("No media file available to send")
 
         except Exception as e:
-            if not result:
-                self.debouncer.release_link(
-                    session_id, url, debounce_reservation
-                )
             error_msg = f"Douyin parse failed: {e}\n{traceback.format_exc()}"
             logger.error(error_msg)
             if self.cfg.show_download_fail_tip:
                 yield event.plain_result(f"Parse failed: {str(e)}")
+        finally:
+            if not reservation_committed:
+                self.debouncer.release_link(
+                    session_id, url, debounce_reservation
+                )
 
     @staticmethod
     def _normalize_text(value: Any, default: str = "") -> str:

@@ -50,13 +50,13 @@ class Debouncer:
         return hit
 
     def release_link(
-        self, session_id: str, link: str, reservation: Optional[float] = None
+        self, session_id: str, link: str, reservation: Optional[float]
     ):
-        """Remove the matching reservation so a failed parse can be retried."""
-        session_cache = self.link_cache.get(session_id)
-        if not session_cache:
+        """Remove a reservation only when its token still owns the cache entry."""
+        if reservation is None:
             return
-        if reservation is not None and session_cache.get(link) != reservation:
+        session_cache = self.link_cache.get(session_id)
+        if not session_cache or session_cache.get(link) != reservation:
             return
         session_cache.pop(link, None)
         if not session_cache:
