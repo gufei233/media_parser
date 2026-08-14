@@ -10,10 +10,11 @@ import random
 import string
 import asyncio
 import base64
+import binascii
 import time
 import traceback
 from typing import Optional, Dict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import aiohttp
 from aiohttp import CookieJar
@@ -50,7 +51,7 @@ class AsyncDouyinDownloader:
         self.cf_proxy_url = cf_proxy_url.rstrip("/") if cf_proxy_url else ""
 
         # 配置参数
-        self.download_retry_times = download_retry_times
+        self.download_retry_times = self._normalize_retry_times(download_retry_times)
         self.download_timeout = download_timeout
         self.common_timeout = common_timeout
         self.max_size = max_size  # 字节
@@ -78,7 +79,7 @@ class AsyncDouyinDownloader:
         """Update runtime config without recreating the instance."""
         self.enable_cf_proxy = enable_cf_proxy
         self.cf_proxy_url = cf_proxy_url.rstrip("/") if cf_proxy_url else ""
-        self.download_retry_times = download_retry_times
+        self.download_retry_times = self._normalize_retry_times(download_retry_times)
         self.download_timeout = download_timeout
         self.common_timeout = common_timeout
         self.max_size = max_size
@@ -177,16 +178,72 @@ class AsyncDouyinDownloader:
             return False
         return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
+    @staticmethod
+    def _normalize_retry_times(value) -> int:
+        """Normalize the configured number of retries after the first attempt."""
+        try:
+            retries = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(10, retries))
+
+    @property
+    def _attempt_limit(self) -> int:
+        """Return the first attempt plus the configured extra retries."""
+        return self.download_retry_times + 1
+
+    @staticmethod
+    def _extract_http_url(value: str) -> str:
+        """Extract the first HTTP URL from a URL or a full share message."""
+        if not isinstance(value, str):
+            return ""
+        match = re.search(r"https?://[^\s<>\"']+", value)
+        if not match:
+            return ""
+        return match.group(0).rstrip(",.;:!?)]}>，。；：！？）】》」』")
+
+    @staticmethod
+    def _extract_aweme_id(url: str) -> Optional[str]:
+        """Extract a Douyin work ID from a path or query parameter."""
+        if not isinstance(url, str) or not url:
+            return None
+        match = re.search(r"/(?:video|note|slides)/(\d+)", url)
+        if match:
+            return match.group(1)
+        match = re.search(r"(?:[?&](?:modal_id|mid|aweme_id)=)(\d+)", url)
+        return match.group(1) if match else None
+
+    @classmethod
+    def _extract_aweme_id_from_response(cls, original_url: str, response) -> Optional[str]:
+        """Inspect the complete redirect chain instead of only the final URL."""
+        candidates = [original_url]
+        for item in getattr(response, "history", ()) or ():
+            history_url = str(getattr(item, "url", "") or "")
+            if history_url:
+                candidates.append(history_url)
+            location = getattr(item, "headers", {}).get("Location")
+            if location:
+                candidates.append(urljoin(history_url or original_url, location))
+        final_url = str(getattr(response, "url", "") or "")
+        if final_url:
+            candidates.append(final_url)
+
+        for candidate in candidates:
+            aweme_id = cls._extract_aweme_id(candidate)
+            if aweme_id:
+                return aweme_id
+        return None
+
     async def get_detail(self, url_input: str) -> Optional[dict]:
         """获取视频详情（主入口）"""
         try:
-            # 确保已初始化
-            await self._ensure_tokens()
-
-            url = url_input.strip()
+            url = self._extract_http_url(url_input)
             if not self._is_valid_http_url(url):
                 logger.error(f"无效链接: {url_input}")
                 return None
+
+            # 确保已初始化
+            await self._ensure_tokens()
 
             # 1. 解析短链接获取 aweme_id
             aweme_id = await self._resolve_short_url(url)
@@ -218,7 +275,14 @@ class AsyncDouyinDownloader:
 
             # 4. 发送 API 请求
             result = await self._fetch_detail_api(aweme_id, params)
+
+            # CF 返回不可用结果时，使用已有的直连路径回退一次。
             if not result:
+                if self.enable_cf_proxy and self.cf_proxy_url:
+                    logger.warning("CF detail request failed, retrying direct API once")
+                    return await self._fetch_detail_api(
+                        aweme_id, params, force_direct=True
+                    )
                 return None
 
             # CF 详情链路如果疑似乱码，尝试直连重试并择优结果。
@@ -247,75 +311,81 @@ class AsyncDouyinDownloader:
             return None
 
     async def _resolve_short_url(self, url: str) -> Optional[str]:
-        """
-        解析短链接获取 aweme_id
-        ========== 最关键的 Cookie 保存时机 ==========
-        """
-        url_match = re.search(r'(https?://\S+)', url)
-        if url_match:
-            url = url_match.group(1)
+        """Resolve a Douyin URL and extract its work ID."""
+        url = self._extract_http_url(url)
         if not self._is_valid_http_url(url):
             return None
 
-        session = await self._get_session()
+        # Full Douyin links already contain the ID and need no network request.
+        aweme_id = self._extract_aweme_id(url)
+        if aweme_id:
+            return aweme_id
 
-        # ========== 重定向请求（Cookie 获取的关键时刻）==========
+        session = await self._get_session()
         headers = {
             "User-Agent": USERAGENT,
             "Referer": "https://www.douyin.com/",
         }
 
-        # CF Worker模式需要手动传递Cookie（因为CF Worker不会自动转发cookies）
-        # 直连模式不设置Cookie header，让CookieJar自动管理
+        # CF only proxies the detail API; short links still resolve directly.
         if self.enable_cf_proxy and self.cf_proxy_url:
             headers["Cookie"] = self._get_cookie_string()
 
-        final_url = None
-        for attempt in range(self.download_retry_times):
+        # HEAD is the cheapest way to follow the redirect chain. Douyin may return
+        # 404 for the final HEAD even though the URL (and its ID) are valid.
+        try:
+            async with session.head(
+                url,
+                headers=headers,
+                allow_redirects=True,
+            ) as resp:
+                logger.debug(
+                    f"短链 HEAD 响应: HTTP {resp.status}, 最终URL: {resp.url}"
+                )
+                aweme_id = self._extract_aweme_id_from_response(url, resp)
+                if aweme_id:
+                    self._log_cookie_names()
+                    return aweme_id
+                logger.debug("短链 HEAD 重定向链未包含作品ID，回退 GET")
+        except Exception as e:
+            logger.warning(f"短链 HEAD 请求失败，回退 GET: {e}")
+
+        # Some endpoints treat HEAD differently. GET is a compatibility fallback;
+        # network failures use one initial attempt plus configured extra retries.
+        for attempt in range(self._attempt_limit):
             try:
-                # 使用 HEAD 请求跟随重定向
-                async with session.head(
+                async with session.get(
                     url,
                     headers=headers,
-                    allow_redirects=True
+                    allow_redirects=True,
                 ) as resp:
-                    final_url = str(resp.url)
-                    # CookieJar 会自动保存响应中的 cookies
-                    break
+                    logger.debug(
+                        f"短链 GET 响应: HTTP {resp.status}, 最终URL: {resp.url}"
+                    )
+                    aweme_id = self._extract_aweme_id_from_response(url, resp)
+                    if aweme_id:
+                        self._log_cookie_names()
+                        return aweme_id
+                    logger.error("链接解析失败: 重定向链中未找到作品ID")
+                    return None
             except Exception as e:
-                if attempt == self.download_retry_times - 1:
-                    logger.error(f"链接解析失败(重试{self.download_retry_times}次): {e}")
+                if attempt + 1 >= self._attempt_limit:
+                    logger.error(
+                        f"链接解析失败(GET尝试{self._attempt_limit}次): {e}"
+                    )
                     return None
                 await asyncio.sleep(1)
 
-        if not final_url:
-            logger.error("链接解析失败: 无法获取重定向URL")
-            return None
-
-        logger.debug(f"重定向后 URL: {final_url}")
-
-        # 调试：输出当前所有 cookies（仅在 debug 级别）
-        if logger.level <= 10:  # DEBUG level
-            logger.debug(f"==========当前 CookieJar中的 Cookies==========")
-            for cookie in self._cookie_jar:
-                cookie_value = cookie.value
-                display_value = cookie_value[:50] if len(cookie_value) > 50 else cookie_value
-                logger.debug(f"Cookie from Jar: {cookie.key}={display_value}")
-            for k, v in self._cookies.items():
-                display_value = v[:50] if len(v) > 50 else v
-                logger.debug(f"Cookie manual: {k}={display_value}")
-
-        # 从 URL 中提取 aweme_id
-        pattern = re.compile(r'/(?:video|note|slides)/(\d+)')
-        match = pattern.search(final_url)
-        if match:
-            return match.group(1)
-
-        match = re.search(r'(?:modal_id|mid|aweme_id)=(\d+)', final_url)
-        if match:
-            return match.group(1)
-
         return None
+
+    def _log_cookie_names(self):
+        """Log cookie presence without exposing token values."""
+        if logger.level <= 10:  # DEBUG level
+            jar_names = [cookie.key for cookie in self._cookie_jar]
+            manual_names = list(self._cookies)
+            logger.debug(
+                f"当前 Cookies: jar={jar_names}, manual={manual_names}"
+            )
 
     async def _fetch_detail_api(
         self, aweme_id: str, params: dict, force_direct: bool = False
@@ -324,7 +394,10 @@ class AsyncDouyinDownloader:
         session = await self._get_session()
 
         # 使用 CF 代理或直连
-        if self.enable_cf_proxy and self.cf_proxy_url and not force_direct:
+        use_cf = bool(
+            self.enable_cf_proxy and self.cf_proxy_url and not force_direct
+        )
+        if use_cf:
             api = f"{self.cf_proxy_url}/douyin/aweme/v1/web/aweme/detail/"
         else:
             api = "https://www.douyin.com/aweme/v1/web/aweme/detail/"
@@ -337,64 +410,91 @@ class AsyncDouyinDownloader:
 
         # CF Worker模式需要手动传递Cookie
         # 直连模式不设置Cookie header，让CookieJar自动管理
-        if self.enable_cf_proxy and self.cf_proxy_url and not force_direct:
+        if use_cf:
             headers["Cookie"] = self._get_cookie_string()
-            logger.debug(f"API 请求 Cookie 前50字符: {self._get_cookie_string()[:50]}...")
+            self._log_cookie_names()
 
-        logger.debug(f"API: {api}")
-        logger.debug(f"请求参数: aweme_id={aweme_id}, a_bogus={params.get('a_bogus', '')[:20]}...")
+        route = "CF" if use_cf else "direct"
+        logger.debug(f"详情 API 路由: {route}, aweme_id={aweme_id}")
 
         try:
             async with session.get(api, params=params, headers=headers) as resp:
-                logger.debug(f"API 响应状态: {resp.status}")
-                logger.debug(f"实际请求 URL: {resp.url}")
+                logger.debug(f"详情 API 响应: route={route}, HTTP {resp.status}")
+                raw = await resp.read()
 
-                # CookieJar 会自动保存响应中的 cookies
+                if resp.status != 200:
+                    logger.error(
+                        f"详情 API 请求失败: route={route}, HTTP {resp.status}, body_size={len(raw)}"
+                    )
+                    return None
+                if not raw:
+                    logger.error(f"详情 API 返回空响应: route={route}")
+                    return None
 
-                if resp.status == 200:
+                text = decode_text_bytes(raw)
+                if not text:
+                    logger.error(f"详情 API 响应解码后为空: route={route}")
+                    return None
+
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError as e:
+                    logger.error(
+                        f"详情 API JSON 解析失败: route={route}, error={e.msg}"
+                    )
+                    return None
+
+                # 代理层可能将上游原始响应包装为 Base64 JSON。
+                if isinstance(data, dict) and "encoding" in data:
+                    if data.get("encoding") != "base64" or not isinstance(
+                        data.get("data"), str
+                    ):
+                        logger.error(f"详情 API 代理包装无效: route={route}")
+                        return None
                     try:
-                        # 先读取响应文本，检查是否为空
-                        raw = await resp.read()
-                        text = decode_text_bytes(raw)
-                        if not text or len(text) == 0:
-                            logger.error("API 返回空响应")
+                        decoded_raw = base64.b64decode(data["data"], validate=True)
+                        decoded_text = decode_text_bytes(decoded_raw)
+                        if not decoded_text:
+                            logger.error("详情 API 代理上游返回空响应")
                             return None
-
-                        # 尝试解析 JSON
-                        resp_json = json.loads(text)
-
-                        # 代理层可能将响应 Base64 包装为 JSON。
-                        if isinstance(resp_json, dict) and 'encoding' in resp_json:
-                            if resp_json.get('encoding') == 'base64' and isinstance(resp_json.get('data'), str):
-                                decoded_raw = base64.b64decode(resp_json['data'])
-                                decoded_text = decode_text_bytes(decoded_raw)
-                                data = json.loads(decoded_text)
-                            else:
-                                data = resp_json
-                        else:
-                            data = resp_json
-
-                        if data.get("aweme_detail"):
-                            return self.extractor.extract_data(data["aweme_detail"])
-                        else:
-                            logger.error("未获取到 aweme_detail")
-                            logger.debug(f"响应数据: {json.dumps(data, ensure_ascii=False)[:200]}...")
-                            return None
-                    except json.JSONDecodeError as e:
-                        logger.error(f"JSON 解析失败: {e}")
-                        logger.debug(f"响应内容前200字符: {text[:200] if text else '空'}")
+                        data = json.loads(decoded_text)
+                    except (binascii.Error, ValueError, json.JSONDecodeError) as e:
+                        logger.error(
+                            f"详情 API 代理响应解码失败: {type(e).__name__}"
+                        )
                         return None
-                    except Exception as e:
-                        logger.error(f"处理响应异常: {e}")
-                        return None
-                else:
-                    logger.error(f"API 请求失败: HTTP {resp.status}")
-                    raw = await resp.read()
-                    text = decode_text_bytes(raw)
-                    logger.debug(f"响应内容: {text[:200]}...")
+
+                if not isinstance(data, dict):
+                    logger.error(
+                        f"详情 API 响应类型无效: route={route}, type={type(data).__name__}"
+                    )
+                    return None
+
+                status_code = data.get("status_code")
+                if status_code not in (None, 0):
+                    status_msg = str(data.get("status_msg") or "")[:120]
+                    logger.warning(
+                        f"详情 API 业务状态异常: route={route}, status_code={status_code}, status_msg={status_msg}"
+                    )
+
+                detail = data.get("aweme_detail")
+                if not isinstance(detail, dict) or not detail:
+                    logger.error(
+                        f"详情 API 缺少 aweme_detail: route={route}, status_code={status_code}"
+                    )
+                    return None
+
+                try:
+                    return self.extractor.extract_data(detail)
+                except Exception as e:
+                    logger.error(
+                        f"抖音详情字段提取失败: route={route}, error={type(e).__name__}: {e}"
+                    )
                     return None
         except Exception as e:
-            logger.error(f"API 请求异常: {e}")
+            logger.error(
+                f"详情 API 请求异常: route={route}, error={type(e).__name__}: {e}"
+            )
             return None
 
     async def download_to_bytes(self, url: str) -> Optional[bytes]:
@@ -450,7 +550,7 @@ class AsyncDouyinDownloader:
         # ========== 第一步：尝试直连下载（支持断点续传）==========
         total_size = 0  # 已下载的总字节数
         expected_size = None  # 文件总大小（从首次请求获取）
-        max_stall = self.download_retry_times  # 连续无进展最大次数
+        max_stall = self._attempt_limit  # 首次请求 + 连续无进展重试
         stall_count = 0  # 连续无进展计数
         attempt = 0
 

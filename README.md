@@ -20,7 +20,7 @@
 | `source_max_size` | int | `90` | 最大文件大小（MB） |
 | `source_max_minute` | int | `15` | 最大视频时长（分钟） |
 | `download_timeout` | int | `280` | 下载超时时间（秒） |
-| `download_retry_times` | int | `3` | 下载失败重试次数 |
+| `download_retry_times` | int | `3` | 请求失败后的额外重试次数；0 表示仍执行首次请求，但不额外重试 |
 | `common_timeout` | int | `15` | 普通请求超时时间（秒） |
 | `show_download_fail_tip` | bool | `true` | 是否提示下载失败信息 |
 | `forward_threshold` | int | `3` | 消息合并转发阈值 |
@@ -132,8 +132,8 @@ media_parser/
    - 响应：**CookieJar 自动保存**新 cookies
 
 4. **下载媒体** (`download_video`)
-   - 使用同一个 session → **CookieJar 自动传递** cookies
-   - 不需要手动设置 Cookie header
+   - 复用同一个 session
+   - 请求头会显式加入 CDN 所需的 `dy_swidth` / `dy_sheight` Cookie
 
 ### 关键 Cookies 说明
 
@@ -155,7 +155,7 @@ media_parser/
   ↓                  │ /关闭解析
 防抖检查 ←───────────┘ /解析状态
   ↓
-创建解析器实例（新实例，避免cookie混乱）
+复用插件级解析器实例（共享 CookieJar）
   ↓
 异步解析（CookieJar自动管理Cookie）
   ├─ 初始化tokens（msToken + ttwid）
@@ -168,7 +168,7 @@ media_parser/
   ↓
 发送消息
   ↓
-关闭解析器（清理session和CookieJar）
+插件卸载时关闭共享解析器（清理session）
 ```
 
 ## 项目参考

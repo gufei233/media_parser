@@ -55,6 +55,15 @@ class Debouncer:
         self.link_cache[session_id][link] = now
         return False
 
+    def release_link(self, session_id: str, link: str):
+        """Remove one link reservation so a failed parse can be retried."""
+        session_cache = self.link_cache.get(session_id)
+        if not session_cache:
+            return
+        session_cache.pop(link, None)
+        if not session_cache:
+            self.link_cache.pop(session_id, None)
+
     def hit_resource(self, session_id: str, resource_id: str) -> bool:
         """检查资源ID是否在防抖时间内
 
