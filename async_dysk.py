@@ -309,11 +309,6 @@ class AsyncDouyinDownloader:
         if not self._is_valid_http_url(url):
             return None
 
-        # Full Douyin links already contain the ID and need no network request.
-        aweme_id = self._extract_aweme_id(url)
-        if aweme_id:
-            return aweme_id
-
         session = await self._get_session()
         headers = {
             "User-Agent": USERAGENT,
@@ -324,8 +319,9 @@ class AsyncDouyinDownloader:
         if self.enable_cf_proxy and self.cf_proxy_url:
             headers["Cookie"] = self._get_cookie_string()
 
-        # HEAD is the cheapest way to follow the redirect chain. Douyin may return
-        # 404 for the final HEAD even though the URL (and its ID) are valid.
+        # Visit full and short links alike so the landing page can populate the
+        # CookieJar before the detail API request. Douyin may return 404 for the
+        # final HEAD even though the URL (and its ID) are valid.
         try:
             async with session.head(
                 url,

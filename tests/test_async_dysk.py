@@ -242,16 +242,18 @@ class DouyinUrlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.head_calls), 1)
         self.assertEqual(len(session.get_calls), 1)
 
-    async def test_full_url_avoids_redirect_request(self):
-        downloader = self.make_downloader(retries=0)
-        downloader._get_session = AsyncMock()
-
-        result = await downloader._resolve_short_url(
-            VIDEO_URL
+    async def test_full_url_still_primes_cookies(self):
+        session = FakeSession(
+            heads=(FakeResponse(status=404, url=VIDEO_URL),)
         )
+        downloader = self.make_downloader(retries=0)
+        downloader._get_session = AsyncMock(return_value=session)
+
+        result = await downloader._resolve_short_url(VIDEO_URL)
 
         self.assertEqual(result, AWEME_ID)
-        downloader._get_session.assert_not_awaited()
+        self.assertEqual(len(session.head_calls), 1)
+        self.assertEqual(len(session.get_calls), 0)
 
 
 class DouyinDetailFallbackTests(unittest.IsolatedAsyncioTestCase):
