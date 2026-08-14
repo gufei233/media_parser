@@ -174,6 +174,9 @@ class MediaParserPlugin(Star):
             result = await dy_downloader.get_detail(url)
 
             if not result:
+                self.debouncer.release_link(
+                    session_id, url, debounce_reservation
+                )
                 logger.error("Douyin parse returned None; debounce reservation released")
                 yield event.plain_result(f"Parse failed. Open link directly:\n{url}")
                 return
