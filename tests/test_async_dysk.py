@@ -255,7 +255,7 @@ class DouyinUrlTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DouyinDetailFallbackTests(unittest.IsolatedAsyncioTestCase):
-    async def test_cf_failure_retries_direct_once(self):
+    async def test_cf_failure_does_not_bypass_proxy(self):
         downloader = AsyncDouyinDownloader(
             enable_cf_proxy=True,
             cf_proxy_url="https://worker.example",
@@ -265,18 +265,14 @@ class DouyinDetailFallbackTests(unittest.IsolatedAsyncioTestCase):
         downloader._resolve_short_url = AsyncMock(
             return_value=AWEME_ID
         )
-        expected = {"id": AWEME_ID, "downloads": []}
-        downloader._fetch_detail_api = AsyncMock(side_effect=(None, expected))
+        downloader._fetch_detail_api = AsyncMock(return_value=None)
 
-        result = await downloader.get_detail(
-            SHORT_URL
-        )
+        result = await downloader.get_detail(SHORT_URL)
 
-        self.assertEqual(result, expected)
-        self.assertEqual(downloader._fetch_detail_api.await_count, 2)
-        first_call, second_call = downloader._fetch_detail_api.await_args_list
-        self.assertFalse(first_call.kwargs.get("force_direct", False))
-        self.assertTrue(second_call.kwargs["force_direct"])
+        self.assertIsNone(result)
+        downloader._fetch_detail_api.assert_awaited_once()
+        call = downloader._fetch_detail_api.await_args
+        self.assertFalse(call.kwargs.get("force_direct", False))
 
     async def test_valid_cf_result_does_not_retry_direct(self):
         downloader = AsyncDouyinDownloader(

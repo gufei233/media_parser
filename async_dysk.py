@@ -275,14 +275,7 @@ class AsyncDouyinDownloader:
 
             # 4. 发送 API 请求
             result = await self._fetch_detail_api(aweme_id, params)
-
-            # CF 返回不可用结果时，使用已有的直连路径回退一次。
             if not result:
-                if self.enable_cf_proxy and self.cf_proxy_url:
-                    logger.warning("CF detail request failed, retrying direct API once")
-                    return await self._fetch_detail_api(
-                        aweme_id, params, force_direct=True
-                    )
                 return None
 
             # CF 详情链路如果疑似乱码，尝试直连重试并择优结果。
