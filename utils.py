@@ -1,23 +1,68 @@
 """Shared text utilities for mojibake detection and repair."""
 
 import re
-from typing import Any, Tuple
-
+from typing import Any
 
 # ---------- Latin-path mojibake markers ----------
 _LATIN_MARKERS = (
-    "Ã", "Â", "â", "å", "ä", "ç", "é", "è",
-    "ê", "ë", "ì", "í", "î", "ï", "ð", "ñ",
-    "ò", "ó", "ô", "õ", "ö", "ù", "ú", "û",
-    "ü", "ý", "þ", "€", "™", "\xa0",
+    "Ã",
+    "Â",
+    "â",
+    "å",
+    "ä",
+    "ç",
+    "é",
+    "è",
+    "ê",
+    "ë",
+    "ì",
+    "í",
+    "î",
+    "ï",
+    "ð",
+    "ñ",
+    "ò",
+    "ó",
+    "ô",
+    "õ",
+    "ö",
+    "ù",
+    "ú",
+    "û",
+    "ü",
+    "ý",
+    "þ",
+    "€",
+    "™",
+    "\xa0",
 )
 
 # ---------- GBK-path mojibake markers ----------
 _GBK_MARKERS = (
-    "锛", "銆", "鈥", "鈻", "鎴", "鐨", "鍦",
-    "涓", "鏄", "浣", "鍙", "瀵", "璇", "鎵",
-    "鍒", "绗", "澶", "鍥", "鏂", "鏃", "鍐",
-    "寮", "闂", "閮",
+    "锛",
+    "銆",
+    "鈥",
+    "鈻",
+    "鎴",
+    "鐨",
+    "鍦",
+    "涓",
+    "鏄",
+    "浣",
+    "鍙",
+    "瀵",
+    "璇",
+    "鎵",
+    "鍒",
+    "绗",
+    "澶",
+    "鍥",
+    "鏂",
+    "鏃",
+    "鍐",
+    "寮",
+    "闂",
+    "閮",
 )
 
 # ---------- Common CJK characters for quality scoring ----------
@@ -52,7 +97,7 @@ def common_cjk_score(text: str) -> int:
     return sum(1 for ch in text if ch in _COMMON_CJK)
 
 
-def text_quality(text: str) -> Tuple[int, int, int, int]:
+def text_quality(text: str) -> tuple[int, int, int, int]:
     """Return (quality, cjk_count, common_count, bad_count)."""
     cjk = count_cjk(text)
     common = common_cjk_score(text)

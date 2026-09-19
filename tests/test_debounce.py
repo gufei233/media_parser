@@ -3,9 +3,10 @@ import pathlib
 import unittest
 from unittest.mock import patch
 
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("media_parser_debounce", ROOT / "debounce.py")
+spec = importlib.util.spec_from_file_location(
+    "media_parser_debounce", ROOT / "debounce.py"
+)
 debounce_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(debounce_module)
 Debouncer = debounce_module.Debouncer
@@ -21,9 +22,7 @@ class DebouncerTests(unittest.TestCase):
         self.assertFalse(hit)
         self.assertTrue(debouncer.hit_link("session", "https://example.invalid/a"))
 
-        debouncer.release_link(
-            "session", "https://example.invalid/a", reservation
-        )
+        debouncer.release_link("session", "https://example.invalid/a", reservation)
 
         self.assertFalse(debouncer.hit_link("session", "https://example.invalid/a"))
 
@@ -56,24 +55,16 @@ class DebouncerTests(unittest.TestCase):
 
         debouncer.release_link("session", link, old_reservation)
 
-        self.assertEqual(
-            debouncer.link_cache["session"][link], new_reservation
-        )
+        self.assertEqual(debouncer.link_cache["session"][link], new_reservation)
 
     def test_release_link_is_scoped_and_idempotent(self):
         debouncer = Debouncer(300)
-        _, reservation = debouncer.reserve_link(
-            "session", "https://example.invalid/a"
-        )
+        _, reservation = debouncer.reserve_link("session", "https://example.invalid/a")
         debouncer.hit_link("session", "https://example.invalid/b")
         debouncer.hit_link("other", "https://example.invalid/a")
 
-        debouncer.release_link(
-            "session", "https://example.invalid/a", reservation
-        )
-        debouncer.release_link(
-            "session", "https://example.invalid/a", reservation
-        )
+        debouncer.release_link("session", "https://example.invalid/a", reservation)
+        debouncer.release_link("session", "https://example.invalid/a", reservation)
 
         self.assertFalse(debouncer.hit_link("session", "https://example.invalid/a"))
         self.assertTrue(debouncer.hit_link("session", "https://example.invalid/b"))

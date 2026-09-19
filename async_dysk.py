@@ -3,18 +3,19 @@
 保持原有解析逻辑，使用 aiohttp 替代 requests
 特别注意 Cookie 的传递问题
 """
-import re
-import os
-import json
-import random
-import string
+
 import asyncio
 import base64
 import binascii
+import json
+import logging
+import os
+import random
+import re
+import string
 import time
 import traceback
-from typing import Optional, Dict
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from aiohttp import CookieJar
@@ -22,11 +23,11 @@ from astrbot.api import logger
 
 # 从同步版本导入 ABogus 和 Extractor
 try:
-    from .dysk import ABogus, Extractor, USERAGENT
-    from .utils import result_mojibake_score, decode_text_bytes
+    from .dysk import USERAGENT, ABogus, Extractor
+    from .utils import decode_text_bytes, result_mojibake_score
 except ImportError:
-    from dysk import ABogus, Extractor, USERAGENT
-    from utils import result_mojibake_score, decode_text_bytes
+    from dysk import USERAGENT, ABogus, Extractor
+    from utils import decode_text_bytes, result_mojibake_score
 
 # Token 有效期（秒），超过后重新初始化
 _TOKEN_TTL = 1800
@@ -43,7 +44,7 @@ class AsyncDouyinDownloader:
         download_timeout=280,
         common_timeout=15,
         max_size=None,
-        max_duration=None
+        max_duration=None,
     ):
         self.ab = ABogus(USERAGENT)
         self.extractor = Extractor()
@@ -59,10 +60,10 @@ class AsyncDouyinDownloader:
 
         # ========== Cookie 管理 ==========
         self._cookie_jar = CookieJar(unsafe=True)
-        self._cookies: Dict[str, str] = {}
+        self._cookies: dict[str, str] = {}
 
         # Session 延迟创建
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session: aiohttp.ClientSession | None = None
         self._initialized = False
         self._init_time: float = 0
 
@@ -73,8 +74,8 @@ class AsyncDouyinDownloader:
         download_retry_times: int,
         download_timeout: int,
         common_timeout: int,
-        max_size: Optional[int],
-        max_duration: Optional[int],
+        max_size: int | None,
+        max_duration: int | None,
     ):
         """Update runtime config without recreating the instance."""
         self.enable_cf_proxy = enable_cf_proxy
@@ -90,8 +91,7 @@ class AsyncDouyinDownloader:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=self.common_timeout)
             self._session = aiohttp.ClientSession(
-                timeout=timeout,
-                cookie_jar=self._cookie_jar
+                timeout=timeout, cookie_jar=self._cookie_jar
             )
         return self._session
 
@@ -128,7 +128,7 @@ class AsyncDouyinDownloader:
             "service": "www.ixigua.com",
             "migrate_info": {"ticket": "", "source": "node"},
             "cbUrlProtocol": "https",
-            "union": True
+            "union": True,
         }
 
         session = await self._get_session()
@@ -203,7 +203,7 @@ class AsyncDouyinDownloader:
         return match.group(0).rstrip(",.;:!?)]}>，。；：！？）】》」』")
 
     @staticmethod
-    def _extract_aweme_id(url: str) -> Optional[str]:
+    def _extract_aweme_id(url: str) -> str | None:
         """Extract a Douyin work ID from a path or query parameter."""
         if not isinstance(url, str) or not url:
             return None
@@ -216,7 +216,7 @@ class AsyncDouyinDownloader:
     @classmethod
     def _extract_aweme_id_from_response(
         cls, response, allow_not_found: bool = False
-    ) -> Optional[str]:
+    ) -> str | None:
         """Inspect successful redirect hops and the final response URL."""
         candidates = []
         for item in getattr(response, "history", ()) or ():
@@ -240,7 +240,7 @@ class AsyncDouyinDownloader:
                 return aweme_id
         return None
 
-    async def get_detail(self, url_input: str) -> Optional[dict]:
+    async def get_detail(self, url_input: str) -> dict | None:
         """获取视频详情（主入口）"""
         try:
             url = self._extract_http_url(url_input)
@@ -273,7 +273,7 @@ class AsyncDouyinDownloader:
                 "cookie_enabled": "true",
                 "platform": "PC",
                 "downlink": "10",
-                "msToken": self._cookies.get("msToken", "")
+                "msToken": self._cookies.get("msToken", ""),
             }
 
             # 3. 生成 a_bogus
@@ -309,7 +309,7 @@ class AsyncDouyinDownloader:
             logger.error(traceback.format_exc())
             return None
 
-    async def _resolve_short_url(self, url: str) -> Optional[str]:
+    async def _resolve_short_url(self, url: str) -> str | None:
         """Resolve a Douyin URL and extract its work ID."""
         url = self._extract_http_url(url)
         if not self._is_valid_http_url(url):
@@ -334,9 +334,7 @@ class AsyncDouyinDownloader:
                 headers=headers,
                 allow_redirects=True,
             ) as resp:
-                logger.debug(
-                    f"短链 HEAD 响应: HTTP {resp.status}, 最终URL: {resp.url}"
-                )
+                logger.debug(f"短链 HEAD 响应: HTTP {resp.status}, 最终URL: {resp.url}")
                 aweme_id = self._extract_aweme_id_from_response(
                     resp, allow_not_found=True
                 )
@@ -373,36 +371,28 @@ class AsyncDouyinDownloader:
                 failure = f"{type(e).__name__}: {e}"
 
             if attempt + 1 >= self._attempt_limit:
-                logger.error(
-                    f"链接解析失败(GET尝试{self._attempt_limit}次): {failure}"
-                )
+                logger.error(f"链接解析失败(GET尝试{self._attempt_limit}次): {failure}")
                 return None
-            logger.warning(
-                f"短链 GET 请求失败({failure})，准备第{attempt + 2}次尝试"
-            )
+            logger.warning(f"短链 GET 请求失败({failure})，准备第{attempt + 2}次尝试")
             await asyncio.sleep(1)
 
         return None
 
     def _log_cookie_names(self):
         """Log cookie presence without exposing token values."""
-        if logger.level <= 10:  # DEBUG level
+        if logger.isEnabledFor(logging.DEBUG):
             jar_names = [cookie.key for cookie in self._cookie_jar]
             manual_names = list(self._cookies)
-            logger.debug(
-                f"当前 Cookies: jar={jar_names}, manual={manual_names}"
-            )
+            logger.debug(f"当前 Cookies: jar={jar_names}, manual={manual_names}")
 
     async def _fetch_detail_api(
         self, aweme_id: str, params: dict, force_direct: bool = False
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """请求详情 API"""
         session = await self._get_session()
 
         # 使用 CF 代理或直连
-        use_cf = bool(
-            self.enable_cf_proxy and self.cf_proxy_url and not force_direct
-        )
+        use_cf = bool(self.enable_cf_proxy and self.cf_proxy_url and not force_direct)
         if use_cf:
             api = f"{self.cf_proxy_url}/douyin/aweme/v1/web/aweme/detail/"
         else:
@@ -465,9 +455,7 @@ class AsyncDouyinDownloader:
                             return None
                         data = json.loads(decoded_text)
                     except (binascii.Error, ValueError, json.JSONDecodeError) as e:
-                        logger.error(
-                            f"详情 API 代理响应解码失败: {type(e).__name__}"
-                        )
+                        logger.error(f"详情 API 代理响应解码失败: {type(e).__name__}")
                         return None
 
                 if not isinstance(data, dict):
@@ -503,7 +491,7 @@ class AsyncDouyinDownloader:
             )
             return None
 
-    async def download_to_bytes(self, url: str) -> Optional[bytes]:
+    async def download_to_bytes(self, url: str) -> bytes | None:
         """Download a URL directly into memory, returning bytes or None."""
         if not self._is_valid_http_url(url):
             return None
@@ -528,16 +516,14 @@ class AsyncDouyinDownloader:
                 failure = f"{type(e).__name__}: {e}"
 
             if attempt + 1 >= self._attempt_limit:
-                logger.debug(f"[download_to_bytes] failed after {self._attempt_limit} attempts: {failure}")
+                logger.debug(
+                    f"[download_to_bytes] failed after {self._attempt_limit} attempts: {failure}"
+                )
                 return None
             await asyncio.sleep(1)
         return None
 
-    async def download_video(
-        self,
-        url: str,
-        save_path: str = "video.mp4"
-    ) -> bool:
+    async def download_video(self, url: str, save_path: str = "video.mp4") -> bool:
         """
         下载视频或图片（支持断点续传和CF代理回退）
 
@@ -579,27 +565,33 @@ class AsyncDouyinDownloader:
                     await asyncio.sleep(min(2 * (attempt - 1) + 1, 10))
 
                 req_headers = dict(headers)
-                file_mode = 'wb'
+                file_mode = "wb"
 
                 # 如果已有部分数据，使用 Range 请求续传
                 if total_size > 0 and os.path.exists(save_path):
                     req_headers["Range"] = f"bytes={total_size}-"
-                    file_mode = 'ab'  # 追加模式
-                    logger.info(f"[下载] 续传从 {total_size} bytes 开始 (第{attempt}/{max_attempts}次请求)")
+                    file_mode = "ab"  # 追加模式
+                    logger.info(
+                        f"[下载] 续传从 {total_size} bytes 开始 (第{attempt}/{max_attempts}次请求)"
+                    )
                 elif attempt > 1:
                     logger.info(f"[下载] 重试 (第{attempt}次请求)")
 
                 timeout = aiohttp.ClientTimeout(total=self.download_timeout)
 
-                async with session.get(url, headers=req_headers, timeout=timeout) as resp:
+                async with session.get(
+                    url, headers=req_headers, timeout=timeout
+                ) as resp:
                     status = resp.status
 
                     if status == 416:
                         # Range Not Satisfiable - 文件可能已完整
                         if total_size > 0:
-                            logger.info(f"[下载] 服务器返回416，文件可能已完整: {total_size} bytes")
+                            logger.info(
+                                f"[下载] 服务器返回416，文件可能已完整: {total_size} bytes"
+                            )
                             return True
-                        logger.error(f"[下载] 失败: HTTP 416")
+                        logger.error("[下载] 失败: HTTP 416")
                         break
 
                     if status not in (200, 206):
@@ -611,7 +603,7 @@ class AsyncDouyinDownloader:
                     # 获取文件总大小
                     if status == 200:
                         total_size = 0
-                        file_mode = 'wb'
+                        file_mode = "wb"
                         expected_size = resp.content_length
                     elif status == 206:
                         content_range = resp.headers.get("Content-Range", "")
@@ -621,12 +613,18 @@ class AsyncDouyinDownloader:
                             except (ValueError, IndexError):
                                 pass
                         if total_size == 0:
-                            file_mode = 'wb'
+                            file_mode = "wb"
 
-                    if expected_size and self.max_size and expected_size > self.max_size:
+                    if (
+                        expected_size
+                        and self.max_size
+                        and expected_size > self.max_size
+                    ):
                         size_mb = expected_size / 1024 / 1024
                         limit_mb = self.max_size / 1024 / 1024
-                        logger.warning(f"[下载] 文件大小 {size_mb:.2f}MB 超过限制 {limit_mb:.2f}MB")
+                        logger.warning(
+                            f"[下载] 文件大小 {size_mb:.2f}MB 超过限制 {limit_mb:.2f}MB"
+                        )
                         return False
 
                     try:
@@ -638,7 +636,9 @@ class AsyncDouyinDownloader:
 
                                     if self.max_size and total_size > self.max_size:
                                         limit_mb = self.max_size / 1024 / 1024
-                                        logger.warning(f"[下载] 实际大小超过限制 {limit_mb:.2f}MB，停止下载")
+                                        logger.warning(
+                                            f"[下载] 实际大小超过限制 {limit_mb:.2f}MB，停止下载"
+                                        )
                                         f.close()
                                         if os.path.exists(save_path):
                                             os.unlink(save_path)
@@ -646,34 +646,50 @@ class AsyncDouyinDownloader:
 
                         # 检查是否下载完整
                         if expected_size and total_size >= expected_size:
-                            logger.info(f"[下载] 完成: {save_path}, 大小: {total_size} bytes")
+                            logger.info(
+                                f"[下载] 完成: {save_path}, 大小: {total_size} bytes"
+                            )
                             return True
                         elif expected_size:
                             ratio = total_size / expected_size
                             if ratio >= 0.95:
-                                logger.info(f"[下载] 近似完成（{ratio:.1%}）: {save_path}, {total_size}/{expected_size} bytes")
+                                logger.info(
+                                    f"[下载] 近似完成（{ratio:.1%}）: {save_path}, {total_size}/{expected_size} bytes"
+                                )
                                 return True
                             else:
-                                logger.warning(f"[下载] 连接断开，已下载 {ratio:.1%} ({total_size}/{expected_size} bytes)，将续传...")
+                                logger.warning(
+                                    f"[下载] 连接断开，已下载 {ratio:.1%} ({total_size}/{expected_size} bytes)，将续传..."
+                                )
                         else:
-                            logger.info(f"[下载] 完成: {save_path}, 大小: {total_size} bytes")
+                            logger.info(
+                                f"[下载] 完成: {save_path}, 大小: {total_size} bytes"
+                            )
                             return True
 
                     except aiohttp.ClientPayloadError:
                         if expected_size and total_size > 0:
                             ratio = total_size / expected_size
                             if ratio >= 0.95:
-                                logger.warning(f"[下载] 近似完成（{ratio:.1%}）: {save_path}, {total_size}/{expected_size} bytes")
+                                logger.warning(
+                                    f"[下载] 近似完成（{ratio:.1%}）: {save_path}, {total_size}/{expected_size} bytes"
+                                )
                                 return True
-                            logger.warning(f"[下载] 连接中断（{ratio:.1%}），已下载 {total_size}/{expected_size} bytes，将续传...")
+                            logger.warning(
+                                f"[下载] 连接中断（{ratio:.1%}），已下载 {total_size}/{expected_size} bytes，将续传..."
+                            )
                         elif total_size > 0:
-                            logger.warning(f"[下载] 连接中断（无总大小），已下载 {total_size} bytes，将续传...")
+                            logger.warning(
+                                f"[下载] 连接中断（无总大小），已下载 {total_size} bytes，将续传..."
+                            )
                         else:
-                            logger.error(f"[下载] Payload 错误，无数据")
+                            logger.error("[下载] Payload 错误，无数据")
 
             except asyncio.TimeoutError:
                 if total_size > 0 and expected_size:
-                    logger.warning(f"[下载] 超时，已下载 {total_size}/{expected_size} bytes，将续传...")
+                    logger.warning(
+                        f"[下载] 超时，已下载 {total_size}/{expected_size} bytes，将续传..."
+                    )
                 else:
                     logger.error(f"[下载] 超时 (第{attempt}次请求)")
             except Exception as e:
@@ -693,13 +709,15 @@ class AsyncDouyinDownloader:
                 logger.warning(f"[下载] 重试耗尽但近似完成（{ratio:.1%}），保留文件")
                 return True
             else:
-                logger.error(f"[下载] 重试耗尽，仅下载 {ratio:.1%} ({total_size}/{expected_size} bytes)")
+                logger.error(
+                    f"[下载] 重试耗尽，仅下载 {ratio:.1%} ({total_size}/{expected_size} bytes)"
+                )
                 if os.path.exists(save_path):
                     os.unlink(save_path)
 
         # ========== 第二步：如果直连失败且启用了CF代理，则尝试代理下载 ==========
         if self.enable_cf_proxy and self.cf_proxy_url:
-            logger.info(f"[下载] 直连失败，尝试使用CF代理下载...")
+            logger.info("[下载] 直连失败，尝试使用CF代理下载...")
             try:
                 return await self._download_via_cf_proxy(url, save_path)
             except Exception as e:
@@ -738,7 +756,7 @@ class AsyncDouyinDownloader:
                 "Range": "bytes=0-",
                 "Referer": "https://www.douyin.com/?recommend=1",
                 "Cookie": "dy_swidth=1536; dy_sheight=864",
-            }
+            },
         }
 
         try:
@@ -746,9 +764,7 @@ class AsyncDouyinDownloader:
 
             timeout = aiohttp.ClientTimeout(total=self.download_timeout)
             async with session.post(
-                proxy_url,
-                json=proxy_data,
-                timeout=timeout
+                proxy_url, json=proxy_data, timeout=timeout
             ) as resp:
                 # Worker 错误时返回 JSON（status 4xx/5xx）
                 if resp.status >= 400:
@@ -765,12 +781,14 @@ class AsyncDouyinDownloader:
                 if content_length and self.max_size and content_length > self.max_size:
                     limit_mb = self.max_size / 1024 / 1024
                     size_mb = content_length / 1024 / 1024
-                    logger.warning(f"[下载] CF代理文件大小 {size_mb:.2f}MB 超过限制 {limit_mb:.2f}MB")
+                    logger.warning(
+                        f"[下载] CF代理文件大小 {size_mb:.2f}MB 超过限制 {limit_mb:.2f}MB"
+                    )
                     return False
 
                 # 流式写入文件
                 total_size = 0
-                with open(save_path, 'wb') as f:
+                with open(save_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(65536):
                         if chunk:
                             f.write(chunk)
@@ -778,21 +796,25 @@ class AsyncDouyinDownloader:
 
                             if self.max_size and total_size > self.max_size:
                                 limit_mb = self.max_size / 1024 / 1024
-                                logger.warning(f"[下载] CF代理实际大小超限 {limit_mb:.2f}MB，停止")
+                                logger.warning(
+                                    f"[下载] CF代理实际大小超限 {limit_mb:.2f}MB，停止"
+                                )
                                 f.close()
                                 if os.path.exists(save_path):
                                     os.unlink(save_path)
                                 return False
 
                 if total_size == 0:
-                    logger.error(f"[下载] CF代理返回空内容")
+                    logger.error("[下载] CF代理返回空内容")
                     return False
 
-                logger.info(f"[下载] CF代理下载完成: {save_path}, 大小: {total_size} bytes")
+                logger.info(
+                    f"[下载] CF代理下载完成: {save_path}, 大小: {total_size} bytes"
+                )
                 return True
 
         except asyncio.TimeoutError:
-            logger.error(f"[下载] CF代理超时")
+            logger.error("[下载] CF代理超时")
             return False
         except Exception as e:
             logger.error(f"[下载] CF代理异常: {e}")

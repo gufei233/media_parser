@@ -1,4 +1,5 @@
 """Plugin configuration helpers."""
+
 from urllib.parse import urlparse
 
 from astrbot.api import AstrBotConfig
@@ -33,11 +34,15 @@ class MediaParserConfig:
 
     @property
     def source_max_minute(self):
-        return self._to_int(self.config.get("source_max_minute", 15), 15, 1, 360)  # minutes
+        return self._to_int(
+            self.config.get("source_max_minute", 15), 15, 1, 360
+        )  # minutes
 
     @property
     def download_timeout(self):
-        return self._to_int(self.config.get("download_timeout", 280), 280, 10, 3600)  # seconds
+        return self._to_int(
+            self.config.get("download_timeout", 280), 280, 10, 3600
+        )  # seconds
 
     @property
     def download_retry_times(self):
@@ -45,7 +50,9 @@ class MediaParserConfig:
 
     @property
     def common_timeout(self):
-        return self._to_int(self.config.get("common_timeout", 15), 15, 3, 600)  # seconds
+        return self._to_int(
+            self.config.get("common_timeout", 15), 15, 3, 600
+        )  # seconds
 
     @property
     def show_download_fail_tip(self):
@@ -86,7 +93,9 @@ class MediaParserConfig:
     def save_config(self):
         self.config.save_config()
 
-    def is_session_enabled(self, session_id: str, is_admin: bool, is_wake: bool) -> bool:
+    def is_session_enabled(
+        self, session_id: str, is_admin: bool, is_wake: bool
+    ) -> bool:
         if is_admin:
             return True
         if is_wake:

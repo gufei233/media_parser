@@ -34,12 +34,29 @@ _best_video_url = module._best_video_url
 
 class BestVideoTests(unittest.TestCase):
     def test_prefers_audio_then_h265_then_bitrate(self):
-        url = _best_video_url([
-            {"url": "low", "videoCodec": "h265", "audioCodec": "", "bitrate": 900},
-            {"url": "h264a", "videoCodec": "h264", "audioCodec": "aac", "bitrate": 100},
-            {"url": "h265a", "videoCodec": "h265", "audioCodec": "aac", "bitrate": 200},
-            {"url": "h265a-big", "videoCodec": "h265", "audioCodec": "aac", "bitrate": 500},
-        ])
+        url = _best_video_url(
+            [
+                {"url": "low", "videoCodec": "h265", "audioCodec": "", "bitrate": 900},
+                {
+                    "url": "h264a",
+                    "videoCodec": "h264",
+                    "audioCodec": "aac",
+                    "bitrate": 100,
+                },
+                {
+                    "url": "h265a",
+                    "videoCodec": "h265",
+                    "audioCodec": "aac",
+                    "bitrate": 200,
+                },
+                {
+                    "url": "h265a-big",
+                    "videoCodec": "h265",
+                    "audioCodec": "aac",
+                    "bitrate": 500,
+                },
+            ]
+        )
         self.assertEqual(url, "h265a-big")
 
     def test_empty_details(self):
@@ -60,8 +77,18 @@ class MapResultTests(unittest.TestCase):
             "author": {"name": "a", "id": "u1", "avatar": "https://x/a.jpg"},
             "images": ["https://x/cover.jpg"],
             "videoDetails": [
-                {"url": "https://x/v-264.mp4", "videoCodec": "h264", "audioCodec": "aac", "bitrate": 100},
-                {"url": "https://x/v-265.mp4", "videoCodec": "h265", "audioCodec": "aac", "bitrate": 300},
+                {
+                    "url": "https://x/v-264.mp4",
+                    "videoCodec": "h264",
+                    "audioCodec": "aac",
+                    "bitrate": 100,
+                },
+                {
+                    "url": "https://x/v-265.mp4",
+                    "videoCodec": "h265",
+                    "audioCodec": "aac",
+                    "bitrate": 300,
+                },
             ],
             "videos": ["https://x/v-264.mp4", "https://x/v-265.mp4"],
             "shareUrl": "https://www.xiaohongshu.com/explore/v1",
@@ -98,8 +125,12 @@ class MapResultTests(unittest.TestCase):
         result = self.parser._map_result(note)
         self.assertEqual(result["contentType"], "image")
         self.assertTrue(result["isLivePhoto"])
-        self.assertEqual(result["images"], ["https://x/1.jpg", "https://x/2.jpg", "https://x/3.jpg"])
-        self.assertEqual(result["videos"], ["https://x/live1.mp4", "https://x/live2.mp4"])
+        self.assertEqual(
+            result["images"], ["https://x/1.jpg", "https://x/2.jpg", "https://x/3.jpg"]
+        )
+        self.assertEqual(
+            result["videos"], ["https://x/live1.mp4", "https://x/live2.mp4"]
+        )
         # 配对：图1→live1，图2 无实况，图3→live2
         self.assertEqual(
             result["livePairs"],

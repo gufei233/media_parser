@@ -5,7 +5,6 @@ import sys
 import types
 import unittest
 
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "media_parser_main_testpkg"
 
@@ -73,7 +72,9 @@ async_xhs_stub.AsyncXiaohongshuParser = object
 sys.modules[async_xhs_stub.__name__] = async_xhs_stub
 
 utils_stub = types.ModuleType(f"{PACKAGE_NAME}.utils")
-utils_stub.normalize_text = lambda value, default="": default if value is None else str(value)
+utils_stub.normalize_text = lambda value, default="": (
+    default if value is None else str(value)
+)
 sys.modules[utils_stub.__name__] = utils_stub
 
 package = types.ModuleType(PACKAGE_NAME)
@@ -111,10 +112,14 @@ class LiveForwardSegmentsTest(unittest.TestCase):
         self.assertEqual(
             segments[1],
             [
-                ("image", "l1"), ("video", "v1"),
-                ("image", "l2"), ("video", "v2"),
-                ("image", "l3"), ("video", "v3"),
-                ("image", "l4"), ("video", "v4"),
+                ("image", "l1"),
+                ("video", "v1"),
+                ("image", "l2"),
+                ("video", "v2"),
+                ("image", "l3"),
+                ("video", "v3"),
+                ("image", "l4"),
+                ("video", "v4"),
             ],
         )
 
@@ -138,7 +143,9 @@ class LiveForwardSegmentsTest(unittest.TestCase):
     def test_all_plain_single_segment(self):
         pairs = [{"image": f"s{i}", "video": ""} for i in range(3)]
         segments = _live_forward_segments(pairs)
-        self.assertEqual(segments, [[("image", "s0"), ("image", "s1"), ("image", "s2")]])
+        self.assertEqual(
+            segments, [[("image", "s0"), ("image", "s1"), ("image", "s2")]]
+        )
 
     def test_video_only_pair(self):
         segments = _live_forward_segments([{"image": "", "video": "v1"}])

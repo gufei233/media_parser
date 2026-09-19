@@ -9,7 +9,6 @@ import types
 import unittest
 from unittest.mock import AsyncMock, patch
 
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 # async_dysk imports AstrBot's logger, but parser unit tests do not need AstrBot.
@@ -176,9 +175,7 @@ class DouyinUrlTests(unittest.IsolatedAsyncioTestCase):
         history = FakeResponse(
             status=302,
             url=SHORT_URL,
-            headers={
-                "Location": f"https://www.iesdouyin.com/share/video/{AWEME_ID}/"
-            },
+            headers={"Location": f"https://www.iesdouyin.com/share/video/{AWEME_ID}/"},
         )
         head = FakeResponse(
             status=404,
@@ -189,9 +186,7 @@ class DouyinUrlTests(unittest.IsolatedAsyncioTestCase):
         downloader = self.make_downloader(retries=0)
         downloader._get_session = AsyncMock(return_value=session)
 
-        result = await downloader._resolve_short_url(
-            SHORT_URL
-        )
+        result = await downloader._resolve_short_url(SHORT_URL)
 
         self.assertEqual(result, AWEME_ID)
         self.assertEqual(len(session.head_calls), 1)
@@ -215,9 +210,7 @@ class DouyinUrlTests(unittest.IsolatedAsyncioTestCase):
         downloader = self.make_downloader(retries=0)
         downloader._get_session = AsyncMock(return_value=session)
 
-        result = await downloader._resolve_short_url(
-            SHORT_URL
-        )
+        result = await downloader._resolve_short_url(SHORT_URL)
 
         self.assertEqual(result, AWEME_ID)
         self.assertEqual(len(session.head_calls), 1)
@@ -264,18 +257,14 @@ class DouyinUrlTests(unittest.IsolatedAsyncioTestCase):
         downloader = self.make_downloader(retries=0)
         downloader._get_session = AsyncMock(return_value=session)
 
-        result = await downloader._resolve_short_url(
-            SHORT_URL
-        )
+        result = await downloader._resolve_short_url(SHORT_URL)
 
         self.assertIsNone(result)
         self.assertEqual(len(session.head_calls), 1)
         self.assertEqual(len(session.get_calls), 1)
 
     async def test_full_url_still_primes_cookies(self):
-        session = FakeSession(
-            heads=(FakeResponse(status=404, url=VIDEO_URL),)
-        )
+        session = FakeSession(heads=(FakeResponse(status=404, url=VIDEO_URL),))
         downloader = self.make_downloader(retries=0)
         downloader._get_session = AsyncMock(return_value=session)
 
@@ -294,9 +283,7 @@ class DouyinDetailFallbackTests(unittest.IsolatedAsyncioTestCase):
             download_retry_times=0,
         )
         downloader._ensure_tokens = AsyncMock()
-        downloader._resolve_short_url = AsyncMock(
-            return_value=AWEME_ID
-        )
+        downloader._resolve_short_url = AsyncMock(return_value=AWEME_ID)
         downloader._fetch_detail_api = AsyncMock(return_value=None)
 
         result = await downloader.get_detail(SHORT_URL)
@@ -312,15 +299,11 @@ class DouyinDetailFallbackTests(unittest.IsolatedAsyncioTestCase):
             cf_proxy_url="https://worker.example",
         )
         downloader._ensure_tokens = AsyncMock()
-        downloader._resolve_short_url = AsyncMock(
-            return_value=AWEME_ID
-        )
+        downloader._resolve_short_url = AsyncMock(return_value=AWEME_ID)
         expected = {"id": AWEME_ID, "downloads": []}
         downloader._fetch_detail_api = AsyncMock(return_value=expected)
 
-        result = await downloader.get_detail(
-            SHORT_URL
-        )
+        result = await downloader.get_detail(SHORT_URL)
 
         self.assertEqual(result, expected)
         downloader._fetch_detail_api.assert_awaited_once()
@@ -329,29 +312,21 @@ class DouyinDetailFallbackTests(unittest.IsolatedAsyncioTestCase):
 class DouyinDetailResponseTests(unittest.IsolatedAsyncioTestCase):
     def make_downloader(self, response):
         downloader = AsyncDouyinDownloader()
-        downloader._get_session = AsyncMock(
-            return_value=FakeSession(gets=(response,))
-        )
+        downloader._get_session = AsyncMock(return_value=FakeSession(gets=(response,)))
         return downloader
 
     async def test_direct_json_response_is_extracted(self):
         detail = {"id": AWEME_ID, "downloads": []}
-        body = json.dumps(
-            {"status_code": 0, "aweme_detail": detail}
-        ).encode()
+        body = json.dumps({"status_code": 0, "aweme_detail": detail}).encode()
         downloader = self.make_downloader(FakeResponse(status=200, body=body))
 
-        result = await downloader._fetch_detail_api(
-            AWEME_ID, {"a_bogus": "test"}
-        )
+        result = await downloader._fetch_detail_api(AWEME_ID, {"a_bogus": "test"})
 
         self.assertEqual(result, detail)
 
     async def test_cf_base64_response_is_extracted(self):
         detail = {"id": AWEME_ID, "downloads": []}
-        upstream = json.dumps(
-            {"status_code": 0, "aweme_detail": detail}
-        ).encode()
+        upstream = json.dumps({"status_code": 0, "aweme_detail": detail}).encode()
         body = json.dumps(
             {
                 "encoding": "base64",
@@ -360,20 +335,14 @@ class DouyinDetailResponseTests(unittest.IsolatedAsyncioTestCase):
         ).encode()
         downloader = self.make_downloader(FakeResponse(status=200, body=body))
 
-        result = await downloader._fetch_detail_api(
-            AWEME_ID, {"a_bogus": "test"}
-        )
+        result = await downloader._fetch_detail_api(AWEME_ID, {"a_bogus": "test"})
 
         self.assertEqual(result, detail)
 
     async def test_invalid_payload_type_returns_none(self):
-        downloader = self.make_downloader(
-            FakeResponse(status=200, body=b"[]")
-        )
+        downloader = self.make_downloader(FakeResponse(status=200, body=b"[]"))
 
-        result = await downloader._fetch_detail_api(
-            AWEME_ID, {"a_bogus": "test"}
-        )
+        result = await downloader._fetch_detail_api(AWEME_ID, {"a_bogus": "test"})
 
         self.assertIsNone(result)
 

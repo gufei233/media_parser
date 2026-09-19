@@ -7,7 +7,6 @@ import types
 import unittest
 from unittest.mock import AsyncMock
 
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "media_parser_main_testpkg"
 
@@ -90,7 +89,9 @@ async_xhs_stub.AsyncXiaohongshuParser = object
 sys.modules[async_xhs_stub.__name__] = async_xhs_stub
 
 utils_stub = types.ModuleType(f"{PACKAGE_NAME}.utils")
-utils_stub.normalize_text = lambda value, default="": default if value is None else str(value)
+utils_stub.normalize_text = lambda value, default="": (
+    default if value is None else str(value)
+)
 sys.modules[utils_stub.__name__] = utils_stub
 
 main_spec = importlib.util.spec_from_file_location(
@@ -145,9 +146,7 @@ class MainDebounceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_detail_releases_link_reservation(self):
         plugin = self.make_plugin(None)
-        is_duplicate, reservation = plugin.debouncer.reserve_link(
-            "session", self.URL
-        )
+        is_duplicate, reservation = plugin.debouncer.reserve_link("session", self.URL)
         self.assertFalse(is_duplicate)
 
         results = await self.consume_parse(plugin, reservation)
@@ -164,9 +163,7 @@ class MainDebounceTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
 
         plugin.dy_downloader.get_detail = blocked_detail
-        is_duplicate, reservation = plugin.debouncer.reserve_link(
-            "session", self.URL
-        )
+        is_duplicate, reservation = plugin.debouncer.reserve_link("session", self.URL)
         self.assertFalse(is_duplicate)
         generator = plugin.parse_douyin(
             FakeEvent(), self.URL, debounce_reservation=reservation
@@ -183,9 +180,7 @@ class MainDebounceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_successful_detail_keeps_link_reservation(self):
         plugin = self.make_plugin({"downloads": []})
-        is_duplicate, reservation = plugin.debouncer.reserve_link(
-            "session", self.URL
-        )
+        is_duplicate, reservation = plugin.debouncer.reserve_link("session", self.URL)
         self.assertFalse(is_duplicate)
 
         results = await self.consume_parse(plugin, reservation)

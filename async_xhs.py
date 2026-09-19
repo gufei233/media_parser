@@ -5,6 +5,7 @@
 {'error': True, 'message': ...}（含服务端原始 msg 与 code），由 main.py
 直接把报错输出到会话。
 """
+
 from pathlib import Path
 
 from astrbot.api import logger
@@ -26,7 +27,10 @@ def _default_pool_root() -> str:
         from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
         return str(
-            Path(get_astrbot_data_path()) / "plugin_data" / "media_parser" / "device_pool"
+            Path(get_astrbot_data_path())
+            / "plugin_data"
+            / "media_parser"
+            / "device_pool"
         )
     except Exception:
         return str(Path(__file__).resolve().parent / "xhs_app_data" / "device_pool")

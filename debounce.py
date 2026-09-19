@@ -1,14 +1,15 @@
 """防抖器"""
-import time
+
 import random
+import time
 from collections import defaultdict
-from typing import Dict, Union, Callable, Optional, Tuple
+from collections.abc import Callable
 
 
 class Debouncer:
     """防抖器，防止短时间内重复解析同一链接（支持动态配置）"""
 
-    def __init__(self, interval: Union[int, Callable[[], int]]):
+    def __init__(self, interval: int | Callable[[], int]):
         """初始化防抖器
 
         Args:
@@ -16,9 +17,9 @@ class Debouncer:
         """
         self._interval = interval
         # 链接缓存：{session_id: {link: timestamp}}
-        self.link_cache: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.link_cache: dict[str, dict[str, float]] = defaultdict(dict)
         # 资源ID缓存：{session_id: {resource_id: timestamp}}
-        self.resource_cache: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.resource_cache: dict[str, dict[str, float]] = defaultdict(dict)
 
     @property
     def interval(self) -> int:
@@ -27,7 +28,7 @@ class Debouncer:
             return self._interval()
         return self._interval
 
-    def reserve_link(self, session_id: str, link: str) -> Tuple[bool, Optional[float]]:
+    def reserve_link(self, session_id: str, link: str) -> tuple[bool, float | None]:
         """Reserve a link and return whether it was already active plus its token."""
         if self.interval == 0:
             return False, None
@@ -49,9 +50,7 @@ class Debouncer:
         hit, _ = self.reserve_link(session_id, link)
         return hit
 
-    def release_link(
-        self, session_id: str, link: str, reservation: Optional[float]
-    ):
+    def release_link(self, session_id: str, link: str, reservation: float | None):
         """Remove a reservation only when its token still owns the cache entry."""
         if reservation is None:
             return
