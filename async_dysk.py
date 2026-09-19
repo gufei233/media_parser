@@ -1,6 +1,6 @@
 """
 异步版本的抖音下载器
-保持原有解析逻辑，使用 aiohttp 替代 requests
+API 请求走 aiohttp，媒体下载走 httpx（douyinpic 会拦截 aiohttp 的客户端栈）
 特别注意 Cookie 的传递问题
 """
 
@@ -722,7 +722,7 @@ class AsyncDouyinDownloader:
                             )
                             return True
 
-                    except httpx.RemoteProtocolError:
+                    except (httpx.RemoteProtocolError, httpx.ReadError):
                         if expected_size and total_size > 0:
                             ratio = total_size / expected_size
                             if ratio >= 0.95:
