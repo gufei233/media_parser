@@ -42,7 +42,31 @@ def _load_template(name: str) -> str:
 DOUYIN_INFO_CARD_TEMPLATE = _load_template("douyin_info_card.html")
 
 
-@register("media_parser", "Author", "抖音小红书链接解析插件（异步优化版）", "2.4.0")
+def _live_forward_segments(live_pairs) -> list:
+    """把实况笔记的 livePairs 切成连续媒体段，每段对应一条合并转发。
+
+    连续的普通静图合为一段，连续的实况图合为另一段；实况段内按原顺序
+    静图→实况视频交错。返回 [kind, url] 项列表的列表，kind 为 image/video，
+    节点化由调用方完成。
+    """
+    segments: list = []
+    for pair in live_pairs or []:
+        items: list = []
+        if pair.get("image"):
+            items.append(("image", pair["image"]))
+        if pair.get("video"):
+            items.append(("video", pair["video"]))
+        if not items:
+            continue
+        kind = "live" if pair.get("video") else "plain"
+        if segments and segments[-1][0] == kind:
+            segments[-1][1].extend(items)
+        else:
+            segments.append((kind, items))
+    return [items for _, items in segments]
+
+
+@register("media_parser", "Author", "抖音小红书链接解析插件（异步优化版）", "2.4.1")
 class MediaParserPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -836,19 +860,18 @@ class MediaParserPlugin(Star):
                 if media_nodes:
                     yield event.chain_result([Comp.Nodes(nodes=media_nodes)])
             elif result.get("isLivePhoto") and result.get("livePairs"):
-                # 实况笔记：每张图一条合并转发。有实况的图 = 静图节点 + 实况
-                # 视频节点；同一节点内图+视频混排时平台会吞掉静图，因此必须分节点
-                for pair in result["livePairs"]:
-                    if not pair.get("image"):
-                        continue
-                    nodes_for_image: List[Comp.Node] = [
-                        _media_node([Comp.Image.fromURL(pair["image"])])
-                    ]
-                    if pair.get("video"):
-                        nodes_for_image.append(
-                            _media_node([Comp.Video.fromURL(pair["video"])])
-                        )
-                    yield event.chain_result([Comp.Nodes(nodes=nodes_for_image)])
+                # 实况笔记：连续普通静图合一条合并转发，实况段（静图→实况视频
+                # 交错）合一条。静图与视频必须分节点，同一节点内图+视频混排时
+                # 平台会吞掉静图
+                for items in _live_forward_segments(result["livePairs"]):
+                    seg_nodes: List[Comp.Node] = []
+                    for kind, url in items:
+                        if kind == "image":
+                            seg_nodes.append(_media_node([Comp.Image.fromURL(url)]))
+                        else:
+                            seg_nodes.append(_media_node([Comp.Video.fromURL(url)]))
+                    if seg_nodes:
+                        yield event.chain_result([Comp.Nodes(nodes=seg_nodes)])
             else:
                 # 图文笔记：全部图片放一个合并转发
                 media_nodes = [
