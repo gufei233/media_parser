@@ -821,10 +821,10 @@ class MediaParserPlugin(Star):
                 nodes.append(_text_node(f"链接：{result['originalUrl']}"))
             yield event.chain_result([Comp.Nodes(nodes=nodes)])
 
-            # --- 媒体合并转发 ---
-            media_nodes: List[Comp.Node] = []
+            # --- 媒体输出 ---
             if result.get("contentType") == "video":
                 # 视频笔记：封面 + 全部视频放一个合并转发
+                media_nodes: List[Comp.Node] = []
                 if result.get("cover"):
                     media_nodes.append(
                         _media_node([Comp.Image.fromURL(result["cover"])])
@@ -833,26 +833,30 @@ class MediaParserPlugin(Star):
                     media_nodes.append(
                         _media_node([Comp.Video.fromURL(video_url)])
                     )
+                if media_nodes:
+                    yield event.chain_result([Comp.Nodes(nodes=media_nodes)])
             elif result.get("isLivePhoto") and result.get("livePairs"):
-                # 实况笔记：图1→实况1→图2→实况2… 交错放在一个合并转发
+                # 实况笔记：每张图一条合并转发。有实况的图 = 静图节点 + 实况
+                # 视频节点；同一节点内图+视频混排时平台会吞掉静图，因此必须分节点
                 for pair in result["livePairs"]:
-                    components: list = []
-                    if pair.get("image"):
-                        components.append(Comp.Image.fromURL(pair["image"]))
+                    if not pair.get("image"):
+                        continue
+                    nodes_for_image: List[Comp.Node] = [
+                        _media_node([Comp.Image.fromURL(pair["image"])])
+                    ]
                     if pair.get("video"):
-                        components.append(Comp.Video.fromURL(pair["video"]))
-                    if components:
-                        media_nodes.append(_media_node(components))
+                        nodes_for_image.append(
+                            _media_node([Comp.Video.fromURL(pair["video"])])
+                        )
+                    yield event.chain_result([Comp.Nodes(nodes=nodes_for_image)])
             else:
                 # 图文笔记：全部图片放一个合并转发
-                for img_url in result.get("images") or []:
-                    media_nodes.append(_media_node([Comp.Image.fromURL(img_url)]))
-                if result.get("isLivePhoto"):
-                    # 兜底：实况视频缺失配对信息时按顺序追加
-                    for video_url in result.get("videos") or []:
-                        media_nodes.append(_media_node([Comp.Video.fromURL(video_url)]))
-            if media_nodes:
-                yield event.chain_result([Comp.Nodes(nodes=media_nodes)])
+                media_nodes = [
+                    _media_node([Comp.Image.fromURL(img_url)])
+                    for img_url in result.get("images") or []
+                ]
+                if media_nodes:
+                    yield event.chain_result([Comp.Nodes(nodes=media_nodes)])
 
         except Exception as e:
             error_msg = f"Xiaohongshu parse failed: {e}\n{traceback.format_exc()}"
