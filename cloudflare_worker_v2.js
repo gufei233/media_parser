@@ -123,6 +123,19 @@ async function handleDownload(request) {
 }
 
 // ========== API代理处理器 ==========
+// 出站头白名单：只转发对上游有意义的头。不要复制进站头全集——里面混着
+// Cloudflare 注入的 x-forwarded-for / cdn-loop / cf-* 等，会扩大指纹面并
+// 泄露客户端真实 IP。Cookie 必须转发（ttwid 是详情 API 的硬门槛，缺失会被
+// 边缘层按 anonymous/账户不存在 掐断，实测 2026-09-19）。
+const API_FORWARDED_HEADERS = [
+  "user-agent",
+  "cookie",
+  "referer",
+  "accept",
+  "accept-language",
+  "content-type",
+];
+
 async function handleApiProxy(request, url) {
   const targetHosts = {
     douyin: "www.douyin.com",
@@ -143,22 +156,28 @@ async function handleApiProxy(request, url) {
   const targetUrl = `https://${targetHost}${targetPath}${url.search}`;
 
   try {
-    const headers = new Headers(request.headers);
-    headers.set("Host", targetHost);
+    const headers = new Headers();
+    for (const name of API_FORWARDED_HEADERS) {
+      const value = request.headers.get(name);
+      if (value) {
+        headers.set(name, value);
+      }
+    }
 
-    for (const key of [
-      "cf-connecting-ip",
-      "cf-ipcountry",
-      "cf-ray",
-      "cf-visitor",
-    ]) {
-      headers.delete(key);
+    // POST 带流式 body 时 fetch 会丢 Content-Length（改用 chunked），部分
+    // 上游会拒绝；这里读成 buffer 并显式补齐。
+    let body;
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      body = await request.arrayBuffer();
+      if (body.byteLength > 0) {
+        headers.set("Content-Length", String(body.byteLength));
+      }
     }
 
     const response = await fetch(targetUrl, {
       method: request.method,
       headers: headers,
-      body: request.body,
+      body: body,
       redirect: "follow",
     });
 
