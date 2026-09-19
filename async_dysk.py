@@ -32,16 +32,6 @@ except ImportError:
 # Token 有效期（秒），超过后重新初始化
 _TOKEN_TTL = 1800
 
-# 分享页 SSR 兜底路线：详情 API 依赖 a_bogus 签名与 ttwid cookie，一旦签名
-# 参数被平台更新作废，可退回分享页的 _ROUTER_DATA（同构 aweme 对象，无需签
-# 名）。页面间歇性下发，需要多次重试并轮换路径变体（视频/图集/笔记分享页）；
-# 手机 UA + ttwid 是实测可用组合。
-_SHARE_PAGE_UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-)
-_SHARE_PATH_PLAN = ("video", "video", "slides", "note")
-
 
 class AsyncDouyinDownloader:
     """异步抖音下载器 - 支持实例复用"""
@@ -293,10 +283,7 @@ class AsyncDouyinDownloader:
             # 4. 发送 API 请求
             result = await self._fetch_detail_api(aweme_id, params)
             if not result:
-                # 5. 兜底：分享页 SSR 路线（页面间歇性下发 _ROUTER_DATA，
-                # 数据比详情 API 少 bit_rate/music url，但无签名依赖）
-                logger.warning("详情 API 失败，回退分享页 SSR 路线")
-                return await self._fetch_detail_via_share_page(aweme_id)
+                return None
 
             # CF 详情链路如果疑似乱码，尝试直连重试并择优结果。
             if self.enable_cf_proxy and self.cf_proxy_url:
@@ -504,96 +491,6 @@ class AsyncDouyinDownloader:
                 f"详情 API 请求异常: route={route}, error={type(e).__name__}: {e}"
             )
             return None
-
-    @staticmethod
-    def _extract_share_item(html: str) -> dict | None:
-        """从分享页 SSR HTML 中提取 _ROUTER_DATA 的 item_list 首个 aweme 对象。
-
-        item_list 条目与详情 API 的 aweme_detail 同构（字段名一致），可直接
-        交给 Extractor.extract_data。
-        """
-        match = re.search(
-            r"_ROUTER_DATA\s*=\s*(\{.*?\})\s*;?\s*</script>", html, re.DOTALL
-        )
-        if not match:
-            return None
-        try:
-            router = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            return None
-        loader = router.get("loaderData")
-        if not isinstance(loader, dict):
-            return None
-        for page in loader.values():
-            if not isinstance(page, dict):
-                continue
-            items = (page.get("videoInfoRes") or {}).get("item_list")
-            if isinstance(items, list) and items and isinstance(items[0], dict):
-                return items[0]
-        return None
-
-    @staticmethod
-    def _finalize_share_result(result: dict) -> dict:
-        """分享页结果与详情 API 对齐：去水印播放链、清理缺失字段。"""
-        for item in result.get("downloads") or []:
-            if isinstance(item, dict):
-                for key in ("url", "video"):
-                    url = item.get(key)
-                    if isinstance(url, str) and "/playwm/" in url:
-                        item[key] = url.replace("/playwm/", "/play/")
-        for section in ("author", "music"):
-            block = result.get(section)
-            if isinstance(block, dict):
-                for key, value in block.items():
-                    if value is None:
-                        block[key] = ""
-        return result
-
-    async def _fetch_detail_via_share_page(self, aweme_id: str) -> dict | None:
-        """分享页 SSR 路线（匿名可用）。
-
-        页面间歇性下发 _ROUTER_DATA（实测约 2/3 成功率），按 _SHARE_PATH_PLAN
-        重试并轮换 video/slides/note 路径变体，全部失败返回 None。
-        """
-        session = await self._get_session()
-        headers = {
-            "User-Agent": _SHARE_PAGE_UA,
-            "Referer": "https://www.douyin.com/",
-            "Cookie": self._get_cookie_string(),
-        }
-        attempts = max(3, self._attempt_limit, len(_SHARE_PATH_PLAN))
-        failure = "unknown"
-        for attempt in range(attempts):
-            path = _SHARE_PATH_PLAN[attempt % len(_SHARE_PATH_PLAN)]
-            url = f"https://www.iesdouyin.com/share/{path}/{aweme_id}/"
-            html = ""
-            try:
-                async with session.get(
-                    url, headers=headers, allow_redirects=True
-                ) as resp:
-                    if resp.status == 200:
-                        html = (await resp.read()).decode("utf-8", "replace")
-                    else:
-                        failure = f"HTTP {resp.status}"
-            except Exception as e:
-                failure = f"{type(e).__name__}: {e}"
-
-            item = self._extract_share_item(html) if html else None
-            if item is not None:
-                # 分享页作者对象没有 uid 字段，用抖音号/短号补齐
-                author = item.get("author")
-                if isinstance(author, dict) and not author.get("uid"):
-                    author["uid"] = (
-                        author.get("unique_id") or author.get("short_id") or ""
-                    )
-                logger.info(f"分享页解析成功: path={path}, 第{attempt + 1}次尝试")
-                return self._finalize_share_result(self.extractor.extract_data(item))
-            logger.debug(
-                f"分享页未下发数据({failure})，第{attempt + 1}/{attempts}次: path={path}"
-            )
-            await asyncio.sleep(1)
-        logger.error(f"分享页路线失败({attempts}次): {failure}")
-        return None
 
     async def download_to_bytes(self, url: str) -> bytes | None:
         """Download a URL directly into memory, returning bytes or None."""
