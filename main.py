@@ -70,7 +70,7 @@ def _live_forward_segments(live_pairs) -> list:
     return [items for _, items in segments]
 
 
-@register("media_parser", "顾绯", "抖音小红书链接解析插件（异步优化版）", "2.4.7")
+@register("media_parser", "顾绯", "抖音小红书链接解析插件（异步优化版）", "2.4.8")
 class MediaParserPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)

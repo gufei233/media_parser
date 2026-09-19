@@ -18,6 +18,7 @@ import traceback
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
+import httpx
 from aiohttp import CookieJar
 from astrbot.api import logger
 
@@ -83,6 +84,9 @@ class AsyncDouyinDownloader:
         self._initialized = False
         self._init_time: float = 0
 
+        # 媒体下载专用 httpx 客户端（API 请求仍走 aiohttp session）
+        self._http: httpx.AsyncClient | None = None
+
     def update_config(
         self,
         enable_cf_proxy: bool,
@@ -111,11 +115,29 @@ class AsyncDouyinDownloader:
             )
         return self._session
 
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        """获取或创建媒体下载专用的 httpx 客户端。
+
+        douyinpic 图片 CDN 的 image-cut-tos-priv 桶会按客户端栈指纹拦截
+        aiohttp 请求（实测 2026-09-19：同 URL 同头 aiohttp 403，curl/Node/
+        httpx 200，与 IP 无关），因此媒体下载统一走 httpx。
+        """
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(
+                verify=False,
+                follow_redirects=True,
+                timeout=httpx.Timeout(self.common_timeout),
+            )
+        return self._http
+
     async def close(self):
         """关闭 session"""
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
+        if self._http is not None and not self._http.is_closed:
+            await self._http.aclose()
+        self._http = None
         self._initialized = False
 
     async def _ensure_tokens(self):
@@ -520,7 +542,7 @@ class AsyncDouyinDownloader:
         """Download a URL directly into memory, returning bytes or None."""
         if not self._is_valid_http_url(url):
             return None
-        session = await self._get_session()
+        client = await self._get_http_client()
         headers = {
             "User-Agent": USERAGENT,
             "Accept": "*/*",
@@ -529,15 +551,22 @@ class AsyncDouyinDownloader:
         for attempt in range(self._attempt_limit):
             failure = None
             try:
-                timeout = aiohttp.ClientTimeout(total=self.common_timeout)
-                async with session.get(url, headers=headers, timeout=timeout) as resp:
-                    if resp.status in (200, 206):
-                        return await resp.read()
-                    failure = f"HTTP {resp.status}"
-                    if resp.status not in {408, 425, 429} and resp.status < 500:
+                async with client.stream(
+                    "GET",
+                    url,
+                    headers=headers,
+                    timeout=httpx.Timeout(self.common_timeout),
+                ) as resp:
+                    if resp.status_code in (200, 206):
+                        return await resp.aread()
+                    failure = f"HTTP {resp.status_code}"
+                    if (
+                        resp.status_code not in {408, 425, 429}
+                        and resp.status_code < 500
+                    ):
                         logger.debug(f"[download_to_bytes] {failure} for {url}")
                         return None
-            except Exception as e:
+            except httpx.HTTPError as e:
                 failure = f"{type(e).__name__}: {e}"
 
             if attempt + 1 >= self._attempt_limit:
@@ -560,7 +589,7 @@ class AsyncDouyinDownloader:
             logger.error(f"[下载] 无效URL: {url}")
             return False
 
-        session = await self._get_session()
+        client = await self._get_http_client()
 
         # 下载请求头（参考 TikTokDownloader）
         # - 始终带 Range: bytes=0- 告知CDN客户端支持续传
@@ -602,12 +631,12 @@ class AsyncDouyinDownloader:
                 elif attempt > 1:
                     logger.info(f"[下载] 重试 (第{attempt}次请求)")
 
-                timeout = aiohttp.ClientTimeout(total=self.download_timeout)
+                timeout = httpx.Timeout(self.download_timeout)
 
-                async with session.get(
-                    url, headers=req_headers, timeout=timeout
+                async with client.stream(
+                    "GET", url, headers=req_headers, timeout=timeout
                 ) as resp:
-                    status = resp.status
+                    status = resp.status_code
 
                     if status == 416:
                         # Range Not Satisfiable - 文件可能已完整
@@ -629,7 +658,8 @@ class AsyncDouyinDownloader:
                     if status == 200:
                         total_size = 0
                         file_mode = "wb"
-                        expected_size = resp.content_length
+                        content_length = resp.headers.get("Content-Length")
+                        expected_size = int(content_length) if content_length else None
                     elif status == 206:
                         content_range = resp.headers.get("Content-Range", "")
                         if "/" in content_range:
@@ -654,7 +684,7 @@ class AsyncDouyinDownloader:
 
                     try:
                         with open(save_path, file_mode) as f:
-                            async for chunk in resp.content.iter_chunked(65536):
+                            async for chunk in resp.aiter_bytes(65536):
                                 if chunk:
                                     f.write(chunk)
                                     total_size += len(chunk)
@@ -692,7 +722,7 @@ class AsyncDouyinDownloader:
                             )
                             return True
 
-                    except aiohttp.ClientPayloadError:
+                    except httpx.RemoteProtocolError:
                         if expected_size and total_size > 0:
                             ratio = total_size / expected_size
                             if ratio >= 0.95:
@@ -710,7 +740,7 @@ class AsyncDouyinDownloader:
                         else:
                             logger.error("[下载] Payload 错误，无数据")
 
-            except asyncio.TimeoutError:
+            except httpx.TimeoutException:
                 if total_size > 0 and expected_size:
                     logger.warning(
                         f"[下载] 超时，已下载 {total_size}/{expected_size} bytes，将续传..."
@@ -762,7 +792,7 @@ class AsyncDouyinDownloader:
             logger.error(f"[下载] CF代理目标URL无效: {url}")
             return False
 
-        session = await self._get_session()
+        client = await self._get_http_client()
 
         # 确保 CF Worker URL 以 /download 结尾
         proxy_url = self.cf_proxy_url.rstrip("/")
@@ -787,22 +817,23 @@ class AsyncDouyinDownloader:
         try:
             logger.info(f"[下载] CF代理请求: {proxy_url}")
 
-            timeout = aiohttp.ClientTimeout(total=self.download_timeout)
-            async with session.post(
-                proxy_url, json=proxy_data, timeout=timeout
+            timeout = httpx.Timeout(self.download_timeout)
+            async with client.stream(
+                "POST", proxy_url, json=proxy_data, timeout=timeout
             ) as resp:
                 # Worker 错误时返回 JSON（status 4xx/5xx）
-                if resp.status >= 400:
+                if resp.status_code >= 400:
                     try:
-                        err_data = await resp.json()
-                        error = err_data.get("error", f"HTTP {resp.status}")
+                        err_data = json.loads(await resp.aread())
+                        error = err_data.get("error", f"HTTP {resp.status_code}")
                     except Exception:
-                        error = f"HTTP {resp.status}"
+                        error = f"HTTP {resp.status_code}"
                     logger.error(f"[下载] CF代理返回错误: {error}")
                     return False
 
                 # 检查文件大小限制
-                content_length = resp.content_length
+                raw_length = resp.headers.get("Content-Length")
+                content_length = int(raw_length) if raw_length else None
                 if content_length and self.max_size and content_length > self.max_size:
                     limit_mb = self.max_size / 1024 / 1024
                     size_mb = content_length / 1024 / 1024
@@ -814,7 +845,7 @@ class AsyncDouyinDownloader:
                 # 流式写入文件
                 total_size = 0
                 with open(save_path, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(65536):
+                    async for chunk in resp.aiter_bytes(65536):
                         if chunk:
                             f.write(chunk)
                             total_size += len(chunk)
@@ -838,7 +869,7 @@ class AsyncDouyinDownloader:
                 )
                 return True
 
-        except asyncio.TimeoutError:
+        except httpx.TimeoutException:
             logger.error("[下载] CF代理超时")
             return False
         except Exception as e:

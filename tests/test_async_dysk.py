@@ -88,23 +88,42 @@ class FakeResponse:
         return self._body
 
 
-class FakeContent:
-    def __init__(self, chunks):
-        self._chunks = tuple(chunks)
+class FakeStreamResponse:
+    """httpx.AsyncClient.stream() 的假响应。"""
 
-    async def iter_chunked(self, _size):
+    def __init__(self, *, status=200, headers=None, body=b"", body_chunks=()):
+        self.status_code = status
+        self.headers = headers or {}
+        self._body = body
+        self._chunks = tuple(body_chunks) or ((body,) if body else ())
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def aread(self):
+        return self._body
+
+    async def aiter_bytes(self, _size):
         for chunk in self._chunks:
             yield chunk
 
 
-class FakeDownloadResponse(FakeResponse):
-    def __init__(self, *, body_chunks, content_range):
-        super().__init__(
-            status=206,
-            headers={"Content-Range": content_range},
-        )
-        self.content_length = sum(len(chunk) for chunk in body_chunks)
-        self.content = FakeContent(body_chunks)
+class FakeHttpClient:
+    """httpx.AsyncClient 假件：stream() 按序回放响应并记录调用。"""
+
+    def __init__(self, streams=()):
+        self._streams = list(streams)
+        self.stream_calls = []
+
+    def stream(self, method, url, **kwargs):
+        self.stream_calls.append((method, url, kwargs))
+        item = self._streams.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 class FakeSession:
@@ -350,14 +369,14 @@ class DouyinDetailResponseTests(unittest.IsolatedAsyncioTestCase):
 
 class DouyinDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_download_to_bytes_retries_transient_status(self):
-        session = FakeSession(
-            gets=(
-                FakeResponse(status=503),
-                FakeResponse(status=200, body=b"image"),
+        client = FakeHttpClient(
+            streams=(
+                FakeStreamResponse(status=503),
+                FakeStreamResponse(status=200, body=b"image"),
             )
         )
         downloader = AsyncDouyinDownloader(download_retry_times=1)
-        downloader._get_session = AsyncMock(return_value=session)
+        downloader._get_http_client = AsyncMock(return_value=client)
 
         with patch.object(async_dysk.asyncio, "sleep", AsyncMock()):
             result = await downloader.download_to_bytes(
@@ -365,19 +384,20 @@ class DouyinDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result, b"image")
-        self.assertEqual(len(session.get_calls), 2)
+        self.assertEqual(len(client.stream_calls), 2)
 
     async def test_partial_download_respects_attempt_limit(self):
-        session = FakeSession(
-            gets=(
-                FakeDownloadResponse(
+        client = FakeHttpClient(
+            streams=(
+                FakeStreamResponse(
+                    status=206,
+                    headers={"Content-Range": "bytes 0-6/100"},
                     body_chunks=(b"partial",),
-                    content_range="bytes 0-6/100",
                 ),
             )
         )
         downloader = AsyncDouyinDownloader(download_retry_times=0)
-        downloader._get_session = AsyncMock(return_value=session)
+        downloader._get_http_client = AsyncMock(return_value=client)
         output_path = str(ROOT / "unused-partial-output.mp4")
 
         try:
@@ -389,13 +409,12 @@ class DouyinDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                 os.unlink(output_path)
 
         self.assertFalse(result)
-        self.assertEqual(len(session.get_calls), 1)
+        self.assertEqual(len(client.stream_calls), 1)
 
     async def test_zero_retries_still_starts_download_once(self):
-        response = FakeResponse(status=503)
-        session = FakeSession(gets=(response,))
+        client = FakeHttpClient(streams=(FakeStreamResponse(status=503),))
         downloader = AsyncDouyinDownloader(download_retry_times=0)
-        downloader._get_session = AsyncMock(return_value=session)
+        downloader._get_http_client = AsyncMock(return_value=client)
 
         result = await downloader.download_video(
             "https://example.invalid/video.mp4",
@@ -403,7 +422,37 @@ class DouyinDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertFalse(result)
-        self.assertEqual(len(session.get_calls), 1)
+        self.assertEqual(len(client.stream_calls), 1)
+
+    async def test_resume_sends_range_and_appends(self):
+        """断点续传：第二次请求带 Range 头并以追加模式写文件。"""
+        first = FakeStreamResponse(
+            status=206,
+            headers={"Content-Range": "bytes 0-6/100"},
+            body_chunks=(b"partial",),
+        )
+        second = FakeStreamResponse(
+            status=206,
+            headers={"Content-Range": "bytes 7-99/100"},
+            body_chunks=(b"x" * 93,),
+        )
+        client = FakeHttpClient(streams=(first, second))
+        downloader = AsyncDouyinDownloader(download_retry_times=1)
+        downloader._get_http_client = AsyncMock(return_value=client)
+        output_path = str(ROOT / "unused-resume-output.mp4")
+
+        try:
+            with patch.object(async_dysk.asyncio, "sleep", AsyncMock()):
+                result = await downloader.download_video(
+                    "https://example.invalid/video.mp4", output_path
+                )
+        finally:
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+
+        self.assertTrue(result)
+        second_kwargs = client.stream_calls[1][2]
+        self.assertEqual(second_kwargs["headers"]["Range"], "bytes=7-")
 
 
 class GetDetailFlowTests(unittest.IsolatedAsyncioTestCase):
