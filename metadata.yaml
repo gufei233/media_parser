@@ -3,7 +3,7 @@ desc: 抖音小红书链接解析插件
 display_name: 媒体解析
 short_desc: 抖音、小红书链接解析，小红书走 App 端签名接口（无水印、支持实况）
 author: 顾绯
-version: 2.4.2
+version: 2.4.3
 repo: https://github.com/gufei233/media_parser
 support_platforms:
   - aiocqhttp

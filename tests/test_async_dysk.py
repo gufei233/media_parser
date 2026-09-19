@@ -5,6 +5,7 @@ import logging
 import os
 import pathlib
 import sys
+import time
 import types
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -284,6 +285,7 @@ class DouyinDetailFallbackTests(unittest.IsolatedAsyncioTestCase):
         )
         downloader._ensure_tokens = AsyncMock()
         downloader._resolve_short_url = AsyncMock(return_value=AWEME_ID)
+        downloader._fetch_detail_via_share_page = AsyncMock(return_value=None)
         downloader._fetch_detail_api = AsyncMock(return_value=None)
 
         result = await downloader.get_detail(SHORT_URL)
@@ -300,6 +302,7 @@ class DouyinDetailFallbackTests(unittest.IsolatedAsyncioTestCase):
         )
         downloader._ensure_tokens = AsyncMock()
         downloader._resolve_short_url = AsyncMock(return_value=AWEME_ID)
+        downloader._fetch_detail_via_share_page = AsyncMock(return_value=None)
         expected = {"id": AWEME_ID, "downloads": []}
         downloader._fetch_detail_api = AsyncMock(return_value=expected)
 
@@ -403,6 +406,115 @@ class DouyinDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result)
         self.assertEqual(len(session.get_calls), 1)
+
+
+def _share_page_html(item):
+    router = {
+        "loaderData": {"video_(id)/page": {"videoInfoRes": {"item_list": [item]}}}
+    }
+    return (
+        "<html><script>window._ROUTER_DATA = " + json.dumps(router) + "</script></html>"
+    )
+
+
+class SharePageTests(unittest.IsolatedAsyncioTestCase):
+    def make_downloader(self, retries=0):
+        downloader = AsyncDouyinDownloader(download_retry_times=retries)
+        downloader._initialized = True
+        downloader._init_time = time.monotonic()
+        return downloader
+
+    def test_extract_share_item_parses_router_data(self):
+        item = {"aweme_id": "1", "desc": "d"}
+        html = _share_page_html(item)
+        self.assertEqual(AsyncDouyinDownloader._extract_share_item(html), item)
+
+    def test_extract_share_item_tolerates_null_page(self):
+        router = {
+            "loaderData": {
+                "broken/page": None,
+                "video_(id)/page": {"videoInfoRes": {"item_list": [{"aweme_id": "2"}]}},
+            }
+        }
+        html = "<script>var _ROUTER_DATA = " + json.dumps(router) + ";</script>"
+        self.assertEqual(
+            AsyncDouyinDownloader._extract_share_item(html), {"aweme_id": "2"}
+        )
+
+    def test_extract_share_item_missing_data_returns_none(self):
+        self.assertIsNone(AsyncDouyinDownloader._extract_share_item("<html></html>"))
+        html = '<script>window._ROUTER_DATA = {"loaderData": {}};</script>'
+        self.assertIsNone(AsyncDouyinDownloader._extract_share_item(html))
+
+    def test_finalize_share_result_strips_watermark_and_cleans_none(self):
+        result = {
+            "author": {"nickname": "n", "uid": None, "avatar": "a"},
+            "music": {"title": "t", "author": None, "url": None, "cover": None},
+            "downloads": [
+                {
+                    "type": "video",
+                    "url": "https://aweme.snssdk.com/aweme/v1/playwm/?video_id=v1&ratio=",
+                    "cover": "c",
+                },
+                {
+                    "type": "live_photo",
+                    "image": "i",
+                    "video": "https://aweme.snssdk.com/aweme/v1/playwm/?video_id=v2",
+                },
+            ],
+        }
+        out = AsyncDouyinDownloader._finalize_share_result(result)
+        self.assertNotIn("playwm", out["downloads"][0]["url"])
+        self.assertIn("/play/", out["downloads"][0]["url"])
+        self.assertNotIn("playwm", out["downloads"][1]["video"])
+        self.assertEqual(out["music"]["url"], "")
+        self.assertEqual(out["music"]["cover"], "")
+        self.assertEqual(out["author"]["uid"], "")
+
+    async def test_get_detail_prefers_share_page(self):
+        item = {
+            "aweme_id": AWEME_ID,
+            "desc": "share-page result",
+            "author": {"nickname": "作者", "unique_id": "dyid123"},
+        }
+        head = FakeResponse(status=200, url=VIDEO_URL)
+        garbage = FakeResponse(status=200, body=b"<html>no data</html>")
+        valid = FakeResponse(status=200, body=_share_page_html(item).encode("utf-8"))
+        session = FakeSession(heads=(head,), gets=(garbage, valid))
+        downloader = self.make_downloader()
+        downloader._get_session = AsyncMock(return_value=session)
+
+        with patch.object(async_dysk.asyncio, "sleep", AsyncMock()):
+            result = await downloader.get_detail(SHORT_URL)
+
+        self.assertEqual(result["desc"], "share-page result")
+        # 短链 HEAD 之外只应请求分享页，不应再调详情 API
+        share_calls = [u for u, _ in session.get_calls]
+        self.assertTrue(all("iesdouyin.com/share/" in u for u in share_calls))
+        self.assertEqual(len(share_calls), 2)
+
+    async def test_get_detail_falls_back_to_detail_api(self):
+        detail = {"id": AWEME_ID, "desc": "detail-api result"}
+        head = FakeResponse(status=200, url=VIDEO_URL)
+        garbage_pages = tuple(
+            FakeResponse(status=200, body=b"<html>no data</html>") for _ in range(4)
+        )
+        api = FakeResponse(
+            status=200,
+            body=json.dumps({"aweme_detail": detail}).encode("utf-8"),
+        )
+        session = FakeSession(heads=(head,), gets=(*garbage_pages, api))
+        downloader = self.make_downloader()
+        downloader._get_session = AsyncMock(return_value=session)
+
+        with patch.object(async_dysk.asyncio, "sleep", AsyncMock()):
+            result = await downloader.get_detail(SHORT_URL)
+
+        self.assertEqual(result, detail)
+        share_calls = [u for u, _ in session.get_calls if "iesdouyin.com/share/" in u]
+        self.assertEqual(len(share_calls), 4)
+        api_calls = [u for u, _ in session.get_calls if "aweme/detail" in u]
+        self.assertEqual(len(api_calls), 1)
 
 
 if __name__ == "__main__":
