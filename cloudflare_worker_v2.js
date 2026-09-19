@@ -134,6 +134,8 @@ const API_FORWARDED_HEADERS = [
   "accept",
   "accept-language",
   "content-type",
+  "x-tt-argus",
+  "uifid",
 ];
 
 async function handleApiProxy(request, url) {

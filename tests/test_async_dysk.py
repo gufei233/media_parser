@@ -412,7 +412,7 @@ class GetDetailFlowTests(unittest.IsolatedAsyncioTestCase):
         downloader._initialized = True
         downloader._init_time = time.monotonic()
         # 模拟 _init_tokens 的产物：ttwid 在手（真实场景由注册接口写入 jar）
-        downloader._cookies = {"ttwid": "test-ttwid", "msToken": "test-ms"}
+        downloader._cookies.update({"ttwid": "test-ttwid", "msToken": "test-ms"})
         return downloader
 
     async def test_get_detail_uses_detail_api(self):
@@ -435,6 +435,10 @@ class GetDetailFlowTests(unittest.IsolatedAsyncioTestCase):
         # 详情 API 请求必须显式携带 Cookie（ttwid 域过滤问题）
         api_kwargs = session.get_calls[0][1]
         self.assertIn("ttwid=", api_kwargs["headers"]["Cookie"])
+        # Argus 边缘网关前置头与 uifid 成套参数
+        self.assertEqual(api_kwargs["headers"]["x-tt-argus"], "1")
+        self.assertTrue(api_kwargs["headers"]["uifid"])
+        self.assertIn("uifid", api_kwargs["params"])
 
     async def test_get_detail_failure_returns_none(self):
         head = FakeResponse(status=200, url=VIDEO_URL)

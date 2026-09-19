@@ -62,6 +62,22 @@ class AsyncDouyinDownloader:
         self._cookie_jar = CookieJar(unsafe=True)
         self._cookies: dict[str, str] = {}
 
+        # ========== Argus 边缘网关（ArgusSecurityPlugin）==========
+        # detail 接口要求 x-tt-argus 头 + uifid 与 verifyFp/fp 成套参数，并配套
+        # UIFID_TEMP / s_v_web_id cookie。实测（2026-09-19，经 CF Worker 与直连）
+        # 取值不校验，随机生成且成套一致即可；缺 x-tt-argus 头时报
+        # "Blocked by ArgusSecurityPlugin Uifid Not Found / Signature Not Found"。
+        self._uifid_temp = "".join(
+            random.choice("0123456789abcdef") for _ in range(236)
+        )
+        self._uifid = self._uifid_temp[:80]
+        bc62 = string.ascii_lowercase + string.ascii_uppercase + string.digits
+        self._s_v_web_id = "verify_" + "_".join(
+            "".join(random.choice(bc62) for _ in range(n)) for n in (8, 8, 4, 4, 4, 12)
+        )
+        self._cookies["UIFID_TEMP"] = self._uifid_temp
+        self._cookies["s_v_web_id"] = self._s_v_web_id
+
         # Session 延迟创建
         self._session: aiohttp.ClientSession | None = None
         self._initialized = False
@@ -275,6 +291,10 @@ class AsyncDouyinDownloader:
                 "platform": "PC",
                 "downlink": "10",
                 "msToken": self._cookies.get("msToken", ""),
+                # Argus 要求 uifid 与 verifyFp/fp 成套出现，缺一则 403
+                "uifid": self._uifid,
+                "verifyFp": self._s_v_web_id,
+                "fp": self._s_v_web_id,
             }
 
             # 3. 生成 a_bogus
@@ -403,6 +423,10 @@ class AsyncDouyinDownloader:
         headers = {
             "User-Agent": USERAGENT,
             "Referer": "https://www.douyin.com/",
+            # Argus 边缘网关前置校验：缺这个头直接 403（Uifid/Signature Not
+            # Found），当前网关不校验取值，传任意字符串即可
+            "x-tt-argus": "1",
+            "uifid": self._uifid,
         }
 
         # Cookie 必须显式传递：ttwid 注册在 bytedance.com 域，CookieJar 按域
