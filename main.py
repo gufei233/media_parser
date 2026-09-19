@@ -7,6 +7,7 @@ import os
 import asyncio
 import base64
 import tempfile
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,7 +42,7 @@ def _load_template(name: str) -> str:
 DOUYIN_INFO_CARD_TEMPLATE = _load_template("douyin_info_card.html")
 
 
-@register("media_parser", "Author", "抖音小红书链接解析插件（异步优化版）", "2.3.0")
+@register("media_parser", "Author", "抖音小红书链接解析插件（异步优化版）", "2.4.0")
 class MediaParserPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -71,6 +72,7 @@ class MediaParserPlugin(Star):
         self.xhs_patterns = [
             r"https?://(?:www\.)?xiaohongshu\.com/[^\s]+",
             r"https?://xhslink\.com/[^\s]+",
+            r"https?://xhslink\.cn/[^\s]+",
         ]
 
         logger.info("媒体解析插件初始化完成（异步版）")
@@ -778,34 +780,79 @@ class MediaParserPlugin(Star):
             uin = event.get_sender_id()
             name = event.get_sender_name()
 
-            nodes = []
-            nodes.append(
-                Comp.Node(
-                    uin=uin,
-                    name=name,
-                    content=[Comp.Plain(f"title: {result.get('title', 'Xiaohongshu content')}")],
-                )
-            )
-            nodes.append(
-                Comp.Node(
-                    uin=uin,
-                    name=name,
-                    content=[Comp.Plain(f"content: {result.get('content', '')}")],
-                )
-            )
+            def _text_node(text: str) -> Any:
+                return Comp.Node(uin=uin, name=name, content=[Comp.Plain(text)])
 
+            def _media_node(components: list) -> Any:
+                return Comp.Node(uin=uin, name=name, content=components)
+
+            # --- 信息合并转发：作者 / 标题 / 正文 / 数据 / 话题 / 链接 ---
+            author = result.get("author") or {}
+            counts = result.get("counts") or {}
+
+            author_line = f"作者：{author.get('name') or '未知作者'}"
+            if author.get("redId"):
+                author_line += f"（小红书号：{author['redId']}）"
+            nodes = [
+                _text_node(author_line),
+                _text_node(f"标题：{result.get('title', '小红书内容')}"),
+                _text_node(f"正文：{result.get('content', '')}"),
+            ]
+            stats_line = (
+                f"赞 {self._format_count(counts.get('liked'))} · "
+                f"藏 {self._format_count(counts.get('collected'))} · "
+                f"评 {self._format_count(counts.get('comments'))} · "
+                f"转 {self._format_count(counts.get('shares'))}"
+            )
+            if result.get("isAds"):
+                stats_line += " ｜ 推广"
+            if result.get("ipLocation"):
+                stats_line += f" ｜ IP {result['ipLocation']}"
+            created_at = int(result.get("createdAt") or 0)
+            if created_at > 0:
+                stats_line += (
+                    f" ｜ {time.strftime('%Y-%m-%d %H:%M', time.localtime(created_at))}"
+                )
+            nodes.append(_text_node(stats_line))
+            topics = result.get("topics") or []
+            if topics:
+                nodes.append(_text_node("话题：" + " ".join(f"#{t}" for t in topics[:12])))
+            if result.get("originalUrl"):
+                nodes.append(_text_node(f"链接：{result['originalUrl']}"))
             yield event.chain_result([Comp.Nodes(nodes=nodes)])
 
-            if result.get("cover"):
-                yield event.chain_result([Comp.Image.fromURL(result["cover"])])
-
-            if result.get("images"):
-                for img_url in result["images"]:
-                    yield event.chain_result([Comp.Image.fromURL(img_url)])
-
-            if result.get("videos"):
-                for video_url in result["videos"]:
-                    yield event.chain_result([Comp.Video.fromURL(video_url)])
+            # --- 媒体合并转发 ---
+            media_nodes: List[Comp.Node] = []
+            if result.get("contentType") == "video":
+                # 视频笔记：封面 + 全部视频放一个合并转发
+                if result.get("cover"):
+                    media_nodes.append(
+                        _media_node([Comp.Image.fromURL(result["cover"])])
+                    )
+                for video_url in result.get("videos") or []:
+                    media_nodes.append(
+                        _media_node([Comp.Video.fromURL(video_url)])
+                    )
+            elif result.get("isLivePhoto") and result.get("livePairs"):
+                # 实况笔记：图1→实况1→图2→实况2… 交错放在一个合并转发
+                for pair in result["livePairs"]:
+                    components: list = []
+                    if pair.get("image"):
+                        components.append(Comp.Image.fromURL(pair["image"]))
+                    if pair.get("video"):
+                        components.append(Comp.Video.fromURL(pair["video"]))
+                    if components:
+                        media_nodes.append(_media_node(components))
+            else:
+                # 图文笔记：全部图片放一个合并转发
+                for img_url in result.get("images") or []:
+                    media_nodes.append(_media_node([Comp.Image.fromURL(img_url)]))
+                if result.get("isLivePhoto"):
+                    # 兜底：实况视频缺失配对信息时按顺序追加
+                    for video_url in result.get("videos") or []:
+                        media_nodes.append(_media_node([Comp.Video.fromURL(video_url)]))
+            if media_nodes:
+                yield event.chain_result([Comp.Nodes(nodes=media_nodes)])
 
         except Exception as e:
             error_msg = f"Xiaohongshu parse failed: {e}\n{traceback.format_exc()}"

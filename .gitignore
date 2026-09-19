@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# 小红书 App 签名解析的设备档案（含身份材料，勿提交）
+xhs_app_data/
+_xhs_device_pool/
+__pycache__/

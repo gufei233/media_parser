@@ -5,6 +5,14 @@
 
 由于抖音的风控，请参考`cloudflare_worker_v2.js`自行部署Cloudflare 代理。
 
+### 小红书解析路径
+
+- **唯一路径（v2.4.0 起）**：App 端签名接口。内置 Android 9.43.1 客户端签名的纯 Python 实现（`xhs_app/` 子包：MUA / SIG / S1 / Shield / SSK），匿名注册设备后直接请求 `imagefeed`，返回无水印图片、视频与实况（Live Photo 含音轨），不依赖网页 Cookie 与 `xsec_token`。
+  - 设备档案持久化在 AstrBot 数据目录（`data/plugin_data/media_parser/device_pool/`），首次解析自动生成，之后复用；遇到 `-100` / `300011` 风控时自动刷新会话或轮换设备。
+  - 视频笔记在多条码流中自动选取一条（优先带音轨的 h265 高码率），实况按图片顺序输出对应视频。
+- 解析失败不回退、不静默：直接把服务端原始报错（msg + code）输出到会话。
+- 分享口令里的 `xhslink.cn` / `xhslink.com` 短链均可识别。
+
 ---
 
 ## ⚙️ 配置说明
@@ -110,7 +118,13 @@ media_parser/
 ├── debounce.py             # 防抖器（含自动清理）
 ├── exceptions.py           # 异常类定义
 ├── async_dysk.py           # 异步抖音下载器（CookieJar管理）
-├── async_xhs.py            # 异步小红书解析器
+├── async_xhs.py            # 异步小红书解析器（App 签名主路径 + HTML 回退）
+├── xhs_app_async.py        # App 签名解析的异步适配层
+├── xhs_app/                # Android 9.43.1 签名算法纯 Python 实现
+│   ├── crypto/             #   SIG / S1 / Shield / MUA / SSK / xyass / XXH3
+│   ├── session.py          #   设备池、匿名会话、风控轮换
+│   └── note.py             #   imagefeed / homefeed 字段解析
+├── xhs_app_data/           # 设备档案运行时数据（gitignore）
 └── dysk.py                 # ABogus算法（同步版，供async_dysk使用）
 ```
 
