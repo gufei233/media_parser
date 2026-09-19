@@ -32,10 +32,10 @@ except ImportError:
 # Token 有效期（秒），超过后重新初始化
 _TOKEN_TTL = 1800
 
-# 分享页 SSR 路线：详情 API 对匿名请求会在边缘层直接掐断（响应头
-# X-Whale-Throughput-Abort-Data 标记 "anonymous/账户不存在"），而分享页的
-# _ROUTER_DATA 仍可匿名获取。页面间歇性下发，需要多次重试并轮换路径变体
-# （视频/图集/笔记分享页）；手机 UA + ttwid 是实测可用组合。
+# 分享页 SSR 兜底路线：详情 API 依赖 a_bogus 签名与 ttwid cookie，一旦签名
+# 参数被平台更新作废，可退回分享页的 _ROUTER_DATA（同构 aweme 对象，无需签
+# 名）。页面间歇性下发，需要多次重试并轮换路径变体（视频/图集/笔记分享页）；
+# 手机 UA + ttwid 是实测可用组合。
 _SHARE_PAGE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
@@ -270,15 +270,8 @@ class AsyncDouyinDownloader:
 
             logger.info(f"解析到 ID: {aweme_id}")
 
-            # 2. 优先走分享页 SSR 路线。详情 API 对匿名请求已在边缘层直接
-            # 掐断（X-Whale-Throughput-Abort-Data: anonymous/账户不存在），
-            # 分享页 _ROUTER_DATA 仍可匿名获取。
-            result = await self._fetch_detail_via_share_page(aweme_id)
-            if result:
-                return result
-            logger.warning("分享页路线失败，回退详情 API（匿名请求可能仍被拒）")
-
-            # 3. 构造 API 请求参数
+            # 2. 详情 API 主路（携带 ttwid cookie 后匿名可用，且数据最全：
+            # bit_rate 码流、music.play_url）
             params = {
                 "device_platform": "webapp",
                 "aid": "6383",
@@ -294,13 +287,16 @@ class AsyncDouyinDownloader:
                 "msToken": self._cookies.get("msToken", ""),
             }
 
-            # 4. 生成 a_bogus
+            # 3. 生成 a_bogus
             params["a_bogus"] = self.ab.get_value(params)
 
-            # 5. 发送 API 请求
+            # 4. 发送 API 请求
             result = await self._fetch_detail_api(aweme_id, params)
             if not result:
-                return None
+                # 5. 兜底：分享页 SSR 路线（页面间歇性下发 _ROUTER_DATA，
+                # 数据比详情 API 少 bit_rate/music url，但无签名依赖）
+                logger.warning("详情 API 失败，回退分享页 SSR 路线")
+                return await self._fetch_detail_via_share_page(aweme_id)
 
             # CF 详情链路如果疑似乱码，尝试直连重试并择优结果。
             if self.enable_cf_proxy and self.cf_proxy_url:
@@ -422,11 +418,11 @@ class AsyncDouyinDownloader:
             "Referer": "https://www.douyin.com/",
         }
 
-        # CF Worker模式需要手动传递Cookie
-        # 直连模式不设置Cookie header，让CookieJar自动管理
-        if use_cf:
-            headers["Cookie"] = self._get_cookie_string()
-            self._log_cookie_names()
+        # Cookie 必须显式传递：ttwid 注册在 bytedance.com 域，CookieJar 按域
+        # 过滤不会把它带给 douyin.com；实测无 cookie 的请求会被边缘层掐断
+        # （X-Whale-Throughput-Abort-Data: anonymous/账户不存在）。
+        headers["Cookie"] = self._get_cookie_string()
+        self._log_cookie_names()
 
         route = "CF" if use_cf else "direct"
         logger.debug(f"详情 API 路由: {route}, aweme_id={aweme_id}")

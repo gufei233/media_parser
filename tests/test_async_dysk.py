@@ -285,8 +285,8 @@ class DouyinDetailFallbackTests(unittest.IsolatedAsyncioTestCase):
         )
         downloader._ensure_tokens = AsyncMock()
         downloader._resolve_short_url = AsyncMock(return_value=AWEME_ID)
-        downloader._fetch_detail_via_share_page = AsyncMock(return_value=None)
         downloader._fetch_detail_api = AsyncMock(return_value=None)
+        downloader._fetch_detail_via_share_page = AsyncMock(return_value=None)
 
         result = await downloader.get_detail(SHORT_URL)
 
@@ -422,6 +422,8 @@ class SharePageTests(unittest.IsolatedAsyncioTestCase):
         downloader = AsyncDouyinDownloader(download_retry_times=retries)
         downloader._initialized = True
         downloader._init_time = time.monotonic()
+        # 模拟 _init_tokens 的产物：ttwid 在手（真实场景由注册接口写入 jar）
+        downloader._cookies = {"ttwid": "test-ttwid", "msToken": "test-ms"}
         return downloader
 
     def test_extract_share_item_parses_router_data(self):
@@ -471,39 +473,14 @@ class SharePageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["music"]["cover"], "")
         self.assertEqual(out["author"]["uid"], "")
 
-    async def test_get_detail_prefers_share_page(self):
-        item = {
-            "aweme_id": AWEME_ID,
-            "desc": "share-page result",
-            "author": {"nickname": "作者", "unique_id": "dyid123"},
-        }
-        head = FakeResponse(status=200, url=VIDEO_URL)
-        garbage = FakeResponse(status=200, body=b"<html>no data</html>")
-        valid = FakeResponse(status=200, body=_share_page_html(item).encode("utf-8"))
-        session = FakeSession(heads=(head,), gets=(garbage, valid))
-        downloader = self.make_downloader()
-        downloader._get_session = AsyncMock(return_value=session)
-
-        with patch.object(async_dysk.asyncio, "sleep", AsyncMock()):
-            result = await downloader.get_detail(SHORT_URL)
-
-        self.assertEqual(result["desc"], "share-page result")
-        # 短链 HEAD 之外只应请求分享页，不应再调详情 API
-        share_calls = [u for u, _ in session.get_calls]
-        self.assertTrue(all("iesdouyin.com/share/" in u for u in share_calls))
-        self.assertEqual(len(share_calls), 2)
-
-    async def test_get_detail_falls_back_to_detail_api(self):
+    async def test_get_detail_uses_detail_api_first(self):
         detail = {"id": AWEME_ID, "desc": "detail-api result"}
         head = FakeResponse(status=200, url=VIDEO_URL)
-        garbage_pages = tuple(
-            FakeResponse(status=200, body=b"<html>no data</html>") for _ in range(4)
-        )
         api = FakeResponse(
             status=200,
             body=json.dumps({"aweme_detail": detail}).encode("utf-8"),
         )
-        session = FakeSession(heads=(head,), gets=(*garbage_pages, api))
+        session = FakeSession(heads=(head,), gets=(api,))
         downloader = self.make_downloader()
         downloader._get_session = AsyncMock(return_value=session)
 
@@ -511,6 +488,36 @@ class SharePageTests(unittest.IsolatedAsyncioTestCase):
             result = await downloader.get_detail(SHORT_URL)
 
         self.assertEqual(result, detail)
+        # 详情 API 成功时不应请求分享页
+        self.assertFalse(
+            [u for u, _ in session.get_calls if "iesdouyin.com/share/" in u]
+        )
+        api_calls = [u for u, _ in session.get_calls if "aweme/detail" in u]
+        self.assertEqual(len(api_calls), 1)
+        # 详情 API 请求必须显式携带 Cookie（ttwid 域过滤问题）
+        api_kwargs = session.get_calls[0][1]
+        self.assertIn("ttwid=", api_kwargs["headers"]["Cookie"])
+
+    async def test_get_detail_falls_back_to_share_page(self):
+        item = {
+            "aweme_id": AWEME_ID,
+            "desc": "share-page result",
+            "author": {"nickname": "作者", "unique_id": "dyid123"},
+        }
+        head = FakeResponse(status=200, url=VIDEO_URL)
+        api_fail = FakeResponse(status=500, body=b"{}")
+        garbage_pages = tuple(
+            FakeResponse(status=200, body=b"<html>no data</html>") for _ in range(3)
+        )
+        valid = FakeResponse(status=200, body=_share_page_html(item).encode("utf-8"))
+        session = FakeSession(heads=(head,), gets=(api_fail, *garbage_pages, valid))
+        downloader = self.make_downloader()
+        downloader._get_session = AsyncMock(return_value=session)
+
+        with patch.object(async_dysk.asyncio, "sleep", AsyncMock()):
+            result = await downloader.get_detail(SHORT_URL)
+
+        self.assertEqual(result["desc"], "share-page result")
         share_calls = [u for u, _ in session.get_calls if "iesdouyin.com/share/" in u]
         self.assertEqual(len(share_calls), 4)
         api_calls = [u for u, _ in session.get_calls if "aweme/detail" in u]
