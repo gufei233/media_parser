@@ -42,14 +42,22 @@ def _best_video_url(details: list) -> str | None:
 class AsyncXhsAppParser:
     """App 端签名解析器（异步包装）。"""
 
-    def __init__(self, pool_root: str | Path | None = None):
+    def __init__(
+        self,
+        pool_root: str | Path | None = None,
+        cf_proxy_url: str | None = None,
+    ):
         self._lock = asyncio.Lock()
         self._manager: ClientManager | None = None
         self._pool_root = pool_root
+        self._cf_proxy_url = cf_proxy_url
 
     def _ensure_manager(self) -> ClientManager:
         if self._manager is None:
-            self._manager = ClientManager(pool_root=self._pool_root)
+            self._manager = ClientManager(
+                pool_root=self._pool_root,
+                cf_proxy_url=self._cf_proxy_url,
+            )
             # session.extract_fields 的风控轮换使用模块级 _manager，
             # 这里替换成带自定义池目录的实例。
             app_session._manager = self._manager
@@ -157,6 +165,8 @@ class AsyncXhsAppParser:
     async def parse(self, text: str) -> dict:
         """解析分享口令 / 短链 / 笔记链接 / note_id。"""
         try:
+            # 确保使用带自定义池目录 / CF 反代配置的管理器实例
+            self._ensure_manager()
             async with self._lock:
                 result = await asyncio.to_thread(
                     app_session.extract_fields, text, None, False

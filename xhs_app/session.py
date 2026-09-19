@@ -83,7 +83,9 @@ def extract_note(payload: dict) -> dict:
 class ClientManager:
     """管理持久化设备、匿名会话刷新和一次性设备轮换。"""
 
-    def __init__(self, pool_root: str | Path | None = None):
+    def __init__(
+        self, pool_root: str | Path | None = None, cf_proxy_url: str | None = None
+    ):
         root = (
             Path(pool_root)
             if pool_root
@@ -92,6 +94,13 @@ class ClientManager:
         self.pool = DevicePool(root)
         self.client = None
         self.profile_path = None
+        self.cf_proxy_url = (cf_proxy_url or "").strip().rstrip("/") or None
+
+    def set_cf_proxy_url(self, cf_proxy_url: str | None):
+        """更新 CF 反代地址并同步到已存在的客户端实例。"""
+        self.cf_proxy_url = (cf_proxy_url or "").strip().rstrip("/") or None
+        if self.client is not None:
+            self.client.cf_proxy_url = self.cf_proxy_url
 
     @staticmethod
     def _make_python_mua_signer(profile_path: Path):
@@ -217,8 +226,7 @@ class ClientManager:
         signer._device_preset = get_device_preset(register_preset)
         return signer
 
-    @staticmethod
-    def _make_client(profile_path: Path):
+    def _make_client(self, profile_path: Path):
         mua_backend = os.environ.get("XHS_MUA_BACKEND", "python").strip().lower()
         if mua_backend not in ("python", ""):
             raise RuntimeError(
@@ -231,6 +239,7 @@ class ClientManager:
             shield_signer=None,
             profile_path=str(profile_path),
             proxy=PROXY or None,
+            cf_proxy_url=self.cf_proxy_url,
         )
         return client
 
@@ -291,6 +300,11 @@ class ClientManager:
 
 
 _manager = ClientManager()
+
+
+def configure_cf_proxy(cf_proxy_url: str | None):
+    """为模块级管理器设置 CF 反代地址（imagefeed 绕行被风控 IP 时使用）。"""
+    _manager.set_cf_proxy_url(cf_proxy_url)
 
 
 def get_client():

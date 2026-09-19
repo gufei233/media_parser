@@ -73,6 +73,7 @@ class XhsAppClient:
         profile_path: str = None,
         shield_signer=None,
         proxy: str = None,
+        cf_proxy_url: str = None,
     ):
         self.profile_path = Path(profile_path) if profile_path else None
         profile = {}
@@ -102,6 +103,9 @@ class XhsAppClient:
         self.signer = signer
         self.shield_signer = shield_signer
         self.session = httpx.Client(verify=False, proxy=proxy or None)
+        # CF Worker 反代（https://xxx.workers.dev）：imagefeed 走 {worker}/xhs/*，
+        # 服务器 IP 被风控（-100/300011）时的绕行路线；签名仍基于真实 edith URL
+        self.cf_proxy_url = (cf_proxy_url or "").strip().rstrip("/") or None
         self.launch_id = int(time.time())
         self.install_time = profile.get("install_time") or time.strftime(
             "%Y-%m-%d %H:%M:%S", time.gmtime()
@@ -342,7 +346,11 @@ class XhsAppClient:
         except urllib.error.HTTPError as exc:
             status = exc.code
             raw = exc.read()
-        return status, json.loads(raw.decode("utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
+        if isinstance(payload, dict) and payload.get("encoding") == "base64":
+            # CF Worker 将上游响应包为 base64 JSON（规避字符集层乱码），在此还原
+            payload = json.loads(base64.b64decode(payload["data"]))
+        return status, payload
 
     # ------------------------------------------------------------------ #
     # 会话引导
@@ -664,8 +672,15 @@ class XhsAppClient:
         headers["x-xhs-ext-failover"] = "128"
         headers["x-xhs-ext-dnsisolatetag"] = "0"
         headers["shield"] = self._compute_shield(url, headers, "")
-        self.last_request = {"url": url, "headers": dict(headers)}
-        self.last_response_status, payload = self._urllib_get_json(url, headers)
+        request_url = url
+        if self.cf_proxy_url:
+            # 只替换请求目标；shield/x-mini 签名仍基于真实 edith 的 path+query，
+            # Worker 原样转发后签名在 edith 侧依然有效
+            request_url = url.replace(
+                "https://edith.xiaohongshu.com", f"{self.cf_proxy_url}/xhs", 1
+            )
+        self.last_request = {"url": request_url, "headers": dict(headers)}
+        self.last_response_status, payload = self._urllib_get_json(request_url, headers)
         return payload
 
     def get_homefeed(self) -> dict:

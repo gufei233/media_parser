@@ -123,10 +123,13 @@ async function handleDownload(request) {
 }
 
 // ========== API代理处理器 ==========
-// 出站头白名单：只转发对上游有意义的头。不要复制进站头全集——里面混着
-// Cloudflare 注入的 x-forwarded-for / cdn-loop / cf-* 等，会扩大指纹面并
-// 泄露客户端真实 IP。Cookie 必须转发（ttwid 是详情 API 的硬门槛，缺失会被
-// 边缘层按 anonymous/账户不存在 掐断，实测 2026-09-19）。
+// 出站头策略按目标站点区分：
+// - douyin/ttwid：白名单（只转发 UA/Cookie/Referer/Accept/AL/CT/x-tt-argus/uifid），
+//   Cookie 必须转发（ttwid 是详情 API 的硬门槛，缺失会被边缘层按
+//   anonymous/账户不存在 掐断，实测 2026-09-19）。
+// - xhs：黑名单（转发全部头，剔除代理注入的脏头）。小红书请求头里 shield、
+//   x-mini-*、xy-* 等十余个自定义头都是签名链的组成部分，白名单法太脆；
+//   签名基于真实 edith 的 path/query 计算，Worker 原样转发即可保持有效。
 const API_FORWARDED_HEADERS = [
   "user-agent",
   "cookie",
@@ -138,16 +141,55 @@ const API_FORWARDED_HEADERS = [
   "uifid",
 ];
 
+// 进站头黑名单（xhs 路线）：剔除 Cloudflare/代理注入的头，避免污染风控
+// 画像；Host/Content-Length 由 fetch 按 URL 自动生成。
+const XHS_EXCLUDED_HEADERS = [
+  "host",
+  "content-length",
+  "cf-connecting-ip",
+  "cf-ipcountry",
+  "cf-ipcity",
+  "cf-ray",
+  "cf-visitor",
+  "cf-worker",
+  "cdn-loop",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-real-ip",
+  "true-client-ip",
+];
+
+function buildForwardedHeaders(targetType, request) {
+  const headers = new Headers();
+  if (targetType === "xhs") {
+    for (const [key, value] of request.headers.entries()) {
+      if (!XHS_EXCLUDED_HEADERS.includes(key.toLowerCase())) {
+        headers.set(key, value);
+      }
+    }
+  } else {
+    for (const name of API_FORWARDED_HEADERS) {
+      const value = request.headers.get(name);
+      if (value) {
+        headers.set(name, value);
+      }
+    }
+  }
+  return headers;
+}
+
 async function handleApiProxy(request, url) {
   const targetHosts = {
     douyin: "www.douyin.com",
     ttwid: "ttwid.bytedance.com",
+    xhs: "edith.xiaohongshu.com",
   };
 
-  const pathMatch = url.pathname.match(/^\/(douyin|ttwid)(\/.*)/);
+  const pathMatch = url.pathname.match(/^\/(douyin|ttwid|xhs)(\/.*)/);
   if (!pathMatch) {
     return new Response(
-      "Invalid path. Use /douyin/* or /ttwid/* for API proxy, or POST /download for file download",
+      "Invalid path. Use /douyin/* or /ttwid/* or /xhs/* for API proxy, or POST /download for file download",
       { status: 400 }
     );
   }
@@ -158,13 +200,7 @@ async function handleApiProxy(request, url) {
   const targetUrl = `https://${targetHost}${targetPath}${url.search}`;
 
   try {
-    const headers = new Headers();
-    for (const name of API_FORWARDED_HEADERS) {
-      const value = request.headers.get(name);
-      if (value) {
-        headers.set(name, value);
-      }
-    }
+    const headers = buildForwardedHeaders(targetType, request);
 
     // POST 带流式 body 时 fetch 会丢 Content-Length（改用 chunked），部分
     // 上游会拒绝；这里读成 buffer 并显式补齐。

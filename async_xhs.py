@@ -39,12 +39,21 @@ def _default_pool_root() -> str:
 class AsyncXiaohongshuParser:
     """小红书 App 签名解析器（异步封装，失败即报错，无兜底路径）。"""
 
-    def __init__(self):
+    def __init__(
+        self,
+        enable_cf_proxy: bool = False,
+        cf_proxy_url: str = "",
+    ):
         self._app_parser: AsyncXhsAppParser | None = None
+        # CF 反代：imagefeed 经 Worker 出口，绕开本机 IP 的风控标记
+        self._cf_proxy_url = cf_proxy_url if enable_cf_proxy else ""
 
     def _get_app_parser(self) -> AsyncXhsAppParser:
         if self._app_parser is None:
-            self._app_parser = AsyncXhsAppParser(pool_root=_default_pool_root())
+            self._app_parser = AsyncXhsAppParser(
+                pool_root=_default_pool_root(),
+                cf_proxy_url=self._cf_proxy_url,
+            )
         return self._app_parser
 
     async def close(self):
