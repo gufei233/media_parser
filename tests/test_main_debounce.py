@@ -86,6 +86,8 @@ sys.modules[async_dysk_stub.__name__] = async_dysk_stub
 
 async_xhs_stub = types.ModuleType(f"{PACKAGE_NAME}.async_xhs")
 async_xhs_stub.AsyncXiaohongshuParser = object
+async_xhs_stub._suffix_from_url = lambda url, default=".bin": default
+async_xhs_stub._suffix_from_bytes = lambda raw, kind, fallback: fallback
 sys.modules[async_xhs_stub.__name__] = async_xhs_stub
 
 utils_stub = types.ModuleType(f"{PACKAGE_NAME}.utils")

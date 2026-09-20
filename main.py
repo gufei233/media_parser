@@ -23,13 +23,21 @@ from PIL import Image
 
 try:
     from .async_dysk import AsyncDouyinDownloader
-    from .async_xhs import AsyncXiaohongshuParser
+    from .async_xhs import (
+        AsyncXiaohongshuParser,
+        _suffix_from_bytes,
+        _suffix_from_url,
+    )
     from .config import MediaParserConfig
     from .debounce import Debouncer
     from .utils import normalize_text
 except ImportError:
     from async_dysk import AsyncDouyinDownloader
-    from async_xhs import AsyncXiaohongshuParser
+    from async_xhs import (
+        AsyncXiaohongshuParser,
+        _suffix_from_bytes,
+        _suffix_from_url,
+    )
     from config import MediaParserConfig
     from debounce import Debouncer
     from utils import normalize_text
@@ -70,7 +78,7 @@ def _live_forward_segments(live_pairs) -> list:
     return [items for _, items in segments]
 
 
-@register("media_parser", "顾绯", "抖音小红书链接解析插件（异步优化版）", "2.4.9")
+@register("media_parser", "顾绯", "抖音小红书链接解析插件（异步优化版）", "2.5.0")
 class MediaParserPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -125,6 +133,10 @@ class MediaParserPlugin(Star):
             common_timeout=self.cfg.common_timeout,
             max_size=self.cfg.max_size,
             max_duration=self.cfg.max_duration,
+        )
+        self.xhs_parser.update_config(
+            enable_cf_proxy=self.cfg.enable_cf_proxy,
+            cf_proxy_url=self.cfg.cf_proxy_url,
         )
 
     async def terminate(self):
@@ -816,10 +828,41 @@ class MediaParserPlugin(Star):
                     except Exception as e:
                         logger.warning(f"Failed to cleanup temp file: {temp_path}, {e}")
 
+    async def _download_xhs_media(self, url: str, kind: str) -> str | None:
+        """Download Xiaohongshu media with App UA; return temp path or None."""
+        if not url:
+            return None
+        suffix = _suffix_from_url(url, ".jpg" if kind == "image" else ".mp4")
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        temp_path = temp_file.name
+        temp_file.close()
+        try:
+            ok = await self.xhs_parser.download_file(url, temp_path)
+            if ok and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                with open(temp_path, "rb") as f:
+                    head = f.read(16)
+                real_suffix = _suffix_from_bytes(head, kind, suffix)
+                if real_suffix != suffix:
+                    renamed = temp_path + real_suffix
+                    os.replace(temp_path, renamed)
+                    return renamed
+                return temp_path
+        except Exception as e:
+            logger.warning(f"XHS media download error: {e}")
+        if os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+        if self.cfg.show_download_fail_tip:
+            logger.warning(f"XHS media download failed: {url[:80]}")
+        return None
+
     async def parse_xiaohongshu(self, event: AstrMessageEvent, url: str):
         """Parse Xiaohongshu link asynchronously."""
         try:
             logger.info(f"Start parsing Xiaohongshu link: {url}")
+            self._sync_downloader_config()
 
             result = await self.xhs_parser.parse(url)
 
@@ -876,39 +919,81 @@ class MediaParserPlugin(Star):
                 nodes.append(_text_node(f"链接：{result['originalUrl']}"))
             yield event.chain_result([Comp.Nodes(nodes=nodes)])
 
-            # --- 媒体输出 ---
-            if result.get("contentType") == "video":
-                # 视频笔记：封面 + 全部视频放一个合并转发
-                media_nodes: list[Comp.Node] = []
-                if result.get("cover"):
-                    media_nodes.append(
-                        _media_node([Comp.Image.fromURL(result["cover"])])
+            # --- 媒体输出：本地下载后再 fromFileSystem。
+            # xhscdn 对无 App UA 的请求 403，AstrBot 自己去拉 fromURL 会失败。
+            self._sync_downloader_config()
+            temp_paths: list[str] = []
+            try:
+                if result.get("contentType") == "video":
+                    media_nodes: list[Comp.Node] = []
+                    if result.get("cover"):
+                        cover_path = await self._download_xhs_media(
+                            result["cover"], "image"
+                        )
+                        if cover_path:
+                            temp_paths.append(cover_path)
+                            media_nodes.append(
+                                _media_node([Comp.Image.fromFileSystem(cover_path)])
+                            )
+                    for video_url in result.get("videos") or []:
+                        video_path = await self._download_xhs_media(video_url, "video")
+                        if video_path:
+                            temp_paths.append(video_path)
+                            media_nodes.append(
+                                _media_node([Comp.Video.fromFileSystem(video_path)])
+                            )
+                    if media_nodes:
+                        yield event.chain_result([Comp.Nodes(nodes=media_nodes)])
+                elif result.get("isLivePhoto") and result.get("livePairs"):
+                    for items in _live_forward_segments(result["livePairs"]):
+                        seg_nodes: list[Comp.Node] = []
+                        for kind, media_url in items:
+                            local = await self._download_xhs_media(media_url, kind)
+                            if not local:
+                                continue
+                            temp_paths.append(local)
+                            if kind == "image":
+                                seg_nodes.append(
+                                    _media_node([Comp.Image.fromFileSystem(local)])
+                                )
+                            else:
+                                seg_nodes.append(
+                                    _media_node([Comp.Video.fromFileSystem(local)])
+                                )
+                        if seg_nodes:
+                            yield event.chain_result([Comp.Nodes(nodes=seg_nodes)])
+                else:
+                    image_urls = list(result.get("images") or [])
+                    sem = asyncio.Semaphore(4)
+
+                    async def _one(img_url: str) -> str | None:
+                        async with sem:
+                            return await self._download_xhs_media(img_url, "image")
+
+                    locals_or_err = await asyncio.gather(
+                        *[_one(u) for u in image_urls], return_exceptions=True
                     )
-                for video_url in result.get("videos") or []:
-                    media_nodes.append(_media_node([Comp.Video.fromURL(video_url)]))
-                if media_nodes:
-                    yield event.chain_result([Comp.Nodes(nodes=media_nodes)])
-            elif result.get("isLivePhoto") and result.get("livePairs"):
-                # 实况笔记：连续普通静图合一条合并转发，实况段（静图→实况视频
-                # 交错）合一条。静图与视频必须分节点，同一节点内图+视频混排时
-                # 平台会吞掉静图
-                for items in _live_forward_segments(result["livePairs"]):
-                    seg_nodes: list[Comp.Node] = []
-                    for kind, url in items:
-                        if kind == "image":
-                            seg_nodes.append(_media_node([Comp.Image.fromURL(url)]))
-                        else:
-                            seg_nodes.append(_media_node([Comp.Video.fromURL(url)]))
-                    if seg_nodes:
-                        yield event.chain_result([Comp.Nodes(nodes=seg_nodes)])
-            else:
-                # 图文笔记：全部图片放一个合并转发
-                media_nodes = [
-                    _media_node([Comp.Image.fromURL(img_url)])
-                    for img_url in result.get("images") or []
-                ]
-                if media_nodes:
-                    yield event.chain_result([Comp.Nodes(nodes=media_nodes)])
+                    media_nodes = []
+                    for item in locals_or_err:
+                        if isinstance(item, Exception) or not item:
+                            continue
+                        temp_paths.append(item)
+                        media_nodes.append(
+                            _media_node([Comp.Image.fromFileSystem(item)])
+                        )
+                    if media_nodes:
+                        yield event.chain_result([Comp.Nodes(nodes=media_nodes)])
+            finally:
+                if temp_paths:
+                    await asyncio.sleep(0.5)
+                    for path in temp_paths:
+                        if path and os.path.exists(path):
+                            try:
+                                os.unlink(path)
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to cleanup temp file: {path}, {e}"
+                                )
 
         except Exception as e:
             error_msg = f"Xiaohongshu parse failed: {e}\n{traceback.format_exc()}"
